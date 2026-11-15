@@ -1,0 +1,16 @@
+{
+  "colab-workstation-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|read_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./pre_tool_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
