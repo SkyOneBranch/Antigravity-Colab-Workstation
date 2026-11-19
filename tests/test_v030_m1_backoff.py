@@ -198,6 +198,77 @@ class M1ElasticBackoffExecutionTests(unittest.TestCase):
         self.assertEqual(len(h.allocate_ids), 1)
         self.assertEqual(len(h.stop_cli_sessions), 1)
 
+    def test_stale_historical_ledger_deadline_ignored_for_backoff(self):
+        h = self.h
+        # Ledger carries a historical deadline already in the past; args.task_deadline_utc is unset.
+        h.new_failures = [
+            RuntimeError("HTTP 503 Service Unavailable"),
+            RuntimeError("HTTP 503 Service Unavailable"),
+            RuntimeError("HTTP 503 Service Unavailable"),
+        ]
+        sleeps = []
+        stale_ledger = {
+            "max_observed_spent_cu": 0.0,
+            "production_task_id": TASK,
+            "project_budget_cu": 30.0,
+            "hard_stop_balance_cu": 132.77,
+            "deadline_utc": "2020-01-01T00:00:00Z",
+        }
+        with mock.patch.object(hc, "initialize_project_budget", return_value=stale_ledger):
+            args = _run_args(
+                allocation_rounds=3,
+                sleep_fn=lambda s: sleeps.append(s),
+                jitter_fn=lambda: 1.0,
+            )
+            res = hc.run_variant(args)
+        self.assertEqual(h.manifest_state()[0], "TASK_COMPLETED")
+        self.assertEqual(res["delivery"]["drive_file_id"], "drive-file-1")
+        self.assertIn(15.0, sleeps)
+        self.assertIn("stale_ledger_deadline_ignored", h.audit_jsonl_text())
+
+    def test_failed_allocation_attempts_mark_leases_stopped_immediately(self):
+        import h3_gpu_lease_registry as reg_mod
+
+        h = self.h
+        registry = reg_mod.LeaseRegistry(h.root / "model_cache" / "gpu_leases.json")
+        registered_sids = []
+
+        def real_register(session, gpu, run_id, task_id, deadline, budget_cu, max_wall_sec=14400):
+            registered_sids.append(session)
+            return registry.register_lease(
+                session_id=session,
+                gpu_model=gpu,
+                run_id=run_id,
+                production_task_id=task_id,
+                owner_id="owner-m1-test",
+                stop_deadline_utc=deadline,
+                budget_cap_cu=budget_cu,
+                max_wall_sec=max_wall_sec,
+            )
+
+        def real_confirm_stopped(session):
+            registry.confirm_stopped(session, "STOPPED")
+
+        # Full Round 1 (G4, G4, A100) fails with 503, then Round 2 G4 succeeds
+        h.new_failures = [
+            RuntimeError("HTTP 503 Service Unavailable"),
+            RuntimeError("HTTP 503 Service Unavailable"),
+            RuntimeError("HTTP 503 Service Unavailable"),
+        ]
+        with mock.patch.object(hc, "_lease_registry", return_value=registry), \
+                mock.patch.object(hc, "_register_gpu_lease", side_effect=real_register), \
+                mock.patch.object(hc, "_confirm_gpu_lease_stopped", side_effect=real_confirm_stopped):
+            args = _run_args(allocation_rounds=2, sleep_fn=lambda s: None, jitter_fn=lambda: 1.0)
+            hc.run_variant(args)
+
+        self.assertEqual(len(registered_sids), 4)
+        # All 4 leases (3 failed attempts + 1 completed run) are STOPPED — zero phantom active/not_yet_due leases!
+        for sid in registered_sids:
+            lease = registry.get_lease(sid)
+            self.assertEqual(lease["last_confirmed_state"], "STOPPED", f"lease {sid} still active/not_yet_due")
+        non_stopped = [l for l in registry.list_leases() if l.get("last_confirmed_state") != "STOPPED"]
+        self.assertEqual(non_stopped, [])
+
 
 if __name__ == "__main__":
     unittest.main()

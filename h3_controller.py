@@ -4279,14 +4279,29 @@ def _run_variant_inner(args) -> dict:
         else:
             # Allocation loop (v0.3.0 M1): outer elastic backoff rounds
             # wrapping inner GPU_ATTEMPT_PLAN = ("G4", "G4", "A100_HIGH_MEM").
+            alloc_started_utc = datetime.datetime.now(datetime.timezone.utc)
             pre_max_rate = max(c["max_rate_cu_h"] for c in GPU_CHOICES.values())
-            pre_deadline = (datetime.datetime.now(datetime.timezone.utc)
+            pre_deadline = (alloc_started_utc
                             + datetime.timedelta(
                                 seconds=initial_session_wall_seconds(pre_max_rate)))
-            effective_deadline = (
-                parse_task_deadline(getattr(args, "task_deadline_utc", "") or "")
-                or (ledger.get("deadline_utc") if isinstance(ledger, dict) else None)
-            )
+            explicit_deadline = parse_task_deadline(getattr(args, "task_deadline_utc", "") or "")
+            ledger_deadline = ledger.get("deadline_utc") if isinstance(ledger, dict) else None
+            effective_deadline = explicit_deadline
+            if effective_deadline is None and ledger_deadline:
+                try:
+                    ledger_dt = datetime.datetime.strptime(
+                        str(ledger_deadline), "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=datetime.timezone.utc)
+                    if ledger_dt <= alloc_started_utc:
+                        record({
+                            "event": "stale_ledger_deadline_ignored",
+                            "run_id": args.run_id,
+                            "stale_deadline_utc": ledger_deadline,
+                        })
+                    else:
+                        effective_deadline = ledger_deadline
+                except ValueError:
+                    effective_deadline = None
             for round_idx in range(allocation_rounds):
                 round_last_capacity_err = None
                 for attempt in range(len(GPU_ATTEMPT_PLAN)):
@@ -4317,6 +4332,17 @@ def _run_variant_inner(args) -> dict:
                             live_sessions = inspect()["sessions"]
                             if any(s["name"] == session for s in live_sessions):
                                 raise RuntimeError(f"Late allocation appeared for {session} after a failed `new`; stop it and abort")
+                            # Confirmed no live session was created for this failed
+                            # attempt: mark its pre-registered lease & allocating
+                            # watchdog record stopped so it never lingers as phantom
+                            # `not_yet_due` in LeaseRegistry.
+                            _confirm_gpu_lease_stopped(session)
+                            try:
+                                from h3_session_watchdog import mark_session_stopped
+
+                                mark_session_stopped(session)
+                            except Exception:
+                                pass
                         except RuntimeError:
                             raise
                         except Exception:
