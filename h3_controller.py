@@ -4188,7 +4188,6 @@ def _run_variant_inner(args) -> dict:
     pre = inspect()
     if pre["cu_balance"] is None:
         raise RuntimeError("Cannot parse CU balance; abort")
-    ensure_no_foreign_sessions(pre)
 
     run_dir = RUNS / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -4197,8 +4196,41 @@ def _run_variant_inner(args) -> dict:
 
     start = time.monotonic()
     warm_claim = None
-    if drive_source == "download":
-        warm_claim = _try_claim_warm_session(args, spec, ledger, run_dir, pre, start)
+    pre_sessions = pre.get("sessions") or []
+    if pre_sessions:
+        # v0.3.0 M4: allow warm-pool reuse ONLY when every active session in
+        # pre["sessions"] is our own valid warm-idle lease. Any foreign or
+        # non-warm-owned active session fails closed immediately.
+        owned_warm_ids: set[str] = set()
+        if drive_source == "download":
+            try:
+                from h3_gpu_lease_registry import current_owner_id
+
+                reg = _lease_registry()
+                if hasattr(reg, "find_warm_leases") and reg.find_warm_leases():
+                    owner = current_owner_id(_COLAB_AUTH)
+                    owned_warm_ids = {
+                        l["session_id"]
+                        for l in reg.find_warm_leases(owner_id=owner)
+                        if l.get("session_id")
+                    }
+            except Exception:  # noqa: BLE001 - fail closed on any registry/owner error
+                owned_warm_ids = set()
+
+        def _pre_sess_name(s) -> str:
+            return s.get("name", "") if isinstance(s, dict) else str(s)
+
+        if any(_pre_sess_name(s) not in owned_warm_ids for s in pre_sessions):
+            ensure_no_foreign_sessions(pre)
+        if drive_source == "download":
+            warm_claim = _try_claim_warm_session(args, spec, ledger, run_dir, pre, start)
+        if warm_claim is None:
+            # Warm claim declined (budget >= 25 CU, manifest mismatch, or
+            # unhealthy :8188): never allocate a 2nd GPU while an active
+            # session is still running.
+            ensure_no_foreign_sessions(pre)
+    else:
+        ensure_no_foreign_sessions(pre)
 
     if warm_claim is None:
         # Watchdog reconciliation: any managed session still active blocks a

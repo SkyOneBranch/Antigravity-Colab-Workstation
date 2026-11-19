@@ -311,6 +311,110 @@ class M4ControllerWarmPoolTests(unittest.TestCase):
             self.assertEqual(lease["run_id"], "r-next")
             self.assertEqual(lease["production_task_id"], "task-next")
 
+    def test_run_variant_reuses_own_warm_session_in_pre_sessions(self):
+        h = self.h
+        registry = reg_mod.LeaseRegistry(h.root / "model_cache" / "gpu_leases.json")
+        manifest_p = h.root / "verified_manifest.json"
+        manifest_p.write_text('{"files":[]}', encoding="utf-8")
+        manifest_sha = hashlib.sha256(manifest_p.read_bytes()).hexdigest()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        future = (now + datetime.timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        warm_sid = "muse-h3-warmreuse1"
+        registry.register_lease(
+            session_id=warm_sid,
+            gpu_model="A100_HIGH_MEM",
+            run_id="r-prev-warm",
+            production_task_id="task-prev",
+            owner_id="owner-warm-test",
+            stop_deadline_utc=future,
+            budget_cap_cu=25.0,
+            max_wall_sec=14400,
+        )
+        registry.mark_warm_idle(
+            warm_sid,
+            warm_ttl_sec=600,
+            warm_expires_at_utc=future,
+            session_budget_spent_cu=3.85,
+            run_id="r-prev-warm",
+            comfy_ref=hc.COMFY_REF_DEFAULT,
+            model_manifest_sha256=manifest_sha,
+            rate_cu_h=10.0,
+        )
+        # pre["sessions"] contains our OWN warm-pooled session!
+        h.inspect_plan = [{"cu_balance": 145.0, "rate": 10.0, "sessions": [{"name": warm_sid}]}]
+        h.query_plan = [SessionState.ACTIVE, SessionState.STOPPED]
+
+        real_fake_exec = h._fake_exec
+
+        def warm_exec(sess, path, timeout=None, env=None):
+            name = Path(path).name
+            if name == "h3_warm_health_probe.py":
+                return {"returncode": 0, "stdout": "MUSE_WARM_HEALTH_OK {}", "stderr": ""}
+            if name == "h3_bootstrap_stage2.py":
+                return {
+                    "returncode": 0,
+                    "stdout": "MUSE_H3_LAUNCH_JSON:" + json.dumps(
+                        {"run_id": RUN_ID, "variant": "A", "pid": 456,
+                         "state_file": "/content/muse_h3/MUSE_H3_JOB_STATE.json",
+                         "log_file": "/content/muse_h3/worker.log"}
+                    ),
+                    "stderr": "",
+                }
+            return real_fake_exec(sess, path, timeout=timeout, env=env)
+
+        with mock.patch.object(hc, "_lease_registry", return_value=registry), \
+                mock.patch("h3_gpu_lease_registry.current_owner_id", return_value="owner-warm-test"), \
+                mock.patch.object(hc, "exec_script", side_effect=warm_exec), \
+                mock.patch.object(hc, "_dispatch_warm_stage2", return_value={
+                    "drive_download": None,
+                    "drive_upload": None,
+                    "task": {"warm_session_reused": True},
+                    "renewal_state": {"count": 0, "last_token_id": None},
+                    "bundled": True,
+                }):
+            args = _run_args(cache_manifest=str(manifest_p), keep_warm_ttl=0)
+            res = hc.run_variant(args)
+
+        # Warm session reused: ZERO new allocations, completed cleanly!
+        self.assertEqual(h.allocate_ids, [])
+        self.assertEqual(res["session"], warm_sid)
+        self.assertEqual(res["delivery"]["drive_file_id"], "drive-file-1")
+        self.assertEqual(h.manifest_state()[0], "TASK_COMPLETED")
+
+    def test_run_variant_still_blocks_foreign_session_even_when_warm_lease_exists(self):
+        h = self.h
+        registry = reg_mod.LeaseRegistry(h.root / "model_cache" / "gpu_leases.json")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        future = (now + datetime.timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        registry.register_lease(
+            session_id="muse-h3-warmown1",
+            gpu_model="A100_HIGH_MEM",
+            run_id="r-prev-warm",
+            production_task_id="task-prev",
+            owner_id="owner-warm-test",
+            stop_deadline_utc=future,
+            budget_cap_cu=25.0,
+            max_wall_sec=14400,
+        )
+        registry.mark_warm_idle(
+            "muse-h3-warmown1",
+            warm_ttl_sec=600,
+            warm_expires_at_utc=future,
+            session_budget_spent_cu=3.85,
+            run_id="r-prev-warm",
+            comfy_ref=hc.COMFY_REF_DEFAULT,
+            model_manifest_sha256="a" * 64,
+            rate_cu_h=10.0,
+        )
+        # pre["sessions"] contains a FOREIGN session -> MUST fail closed!
+        h.inspect_plan = [{"cu_balance": 145.0, "rate": 10.0, "sessions": [{"name": "foreign-other-session"}]}]
+        with mock.patch.object(hc, "_lease_registry", return_value=registry), \
+                mock.patch("h3_gpu_lease_registry.current_owner_id", return_value="owner-warm-test"):
+            args = _run_args(keep_warm_ttl=0)
+            with self.assertRaisesRegex(RuntimeError, "Existing Colab sessions present"):
+                hc.run_variant(args)
+        self.assertEqual(h.allocate_ids, [])
+
 
 if __name__ == "__main__":
     unittest.main()

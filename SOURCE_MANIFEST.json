@@ -647,8 +647,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 247956,
-      "sha256": "65442d886be51825ebf27cd9e0d27f1123584e75f1deae16773b0228729bf141",
+      "size_bytes": 249447,
+      "sha256": "1147867640f71c7be14ad74dd015afb3968133b2b128796a4629eef22f254f8a",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -1313,8 +1313,8 @@
     },
     {
       "path": "tests/test_v030_m4_controller_worker.py",
-      "size_bytes": 13596,
-      "sha256": "8148d0c1b6328bea2b03dcf9776d575770c63579ec60a26974df53257e88aabc",
+      "size_bytes": 18523,
+      "sha256": "766d6351c5848722d77fcaf6efa74dea3b8650777c866ae113136dff932e6214",
       "role": "Tests"
     },
     {
