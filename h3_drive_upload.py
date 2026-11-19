@@ -25,6 +25,8 @@ Rules:
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -66,6 +68,28 @@ class DriveConflictError(DriveUploadError):
 class DriveUploadRetryExhaustedError(DriveUploadError):
     """Transient failures exhausted max_attempts; the sidecar is kept
     so a later run can resume the same session."""
+
+
+_MD5_HEX_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _normalize_md5_hex(value: str | None) -> str:
+    """Normalize an MD5 digest to 32-char lowercase hex.
+    Accepts 32-char hex (case-insensitive) or 24-char Base64 (16-byte digest)
+    so Drive v3 md5Checksum (32-char hex) compares cleanly against either."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if _MD5_HEX_RE.match(text):
+        return text.lower()
+    if len(text) == 24:
+        try:
+            raw = base64.b64decode(text, validate=True)
+            if len(raw) == 16:
+                return raw.hex().lower()
+        except (binascii.Error, ValueError):
+            pass
+    return text.lower()
 
 
 def _sleep(seconds: float) -> None:
@@ -473,8 +497,11 @@ class DriveUploader:
             raise DriveUploadError("Drive file is trashed")
         if int(meta.get("size", -1)) != int(expected_size):
             raise DriveUploadError("Drive file size mismatch")
-        if expected_md5 and meta.get("md5Checksum", "").lower() != expected_md5.lower():
-            raise DriveUploadError("Drive file MD5 mismatch")
+        if expected_md5:
+            server_md5 = _normalize_md5_hex(meta.get("md5Checksum", ""))
+            want_md5 = _normalize_md5_hex(expected_md5)
+            if not server_md5 or server_md5 != want_md5:
+                raise DriveUploadError("Drive file MD5 mismatch")
         server_sha = str(meta.get("sha256Checksum", "")).lower()
         if server_sha and server_sha != expected_sha256.lower():
             raise DriveUploadError("Drive file SHA-256 mismatch")

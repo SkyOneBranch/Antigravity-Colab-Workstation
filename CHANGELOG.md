@@ -1,5 +1,41 @@
 # CHANGELOG
 
+## v0.2.1 — 2026-11-19 — Zero-CU Polish (P1–P3)
+
+Targeted post-benchmark polish based on the `v0.2.0` live A100 run (`489s ->
+230.9s` coldstart, `4.44 CU -> 3.70 CU`). All changes verified at **0.00 CU**.
+
+### Fixed / Improved
+
+- **P1 Drive Upload MD5 Hex Alignment (`h3_remote_worker.py`, `h3_drive_upload.py`)**:
+  - Replaced `_md5_b64` with `_md5_hex` (32-char lowercase hex) in
+    `validate_assembled_mp4()` to match Google Drive API v3 `md5Checksum`
+    directly.
+  - Added defensive `_normalize_md5_hex()` normalization in
+    `DriveUploader.verify_uploaded()` (accepts 32-char hex case-insensitively
+    or 24-char Base64 16-byte digests decoded to hex; fails closed on mismatch
+    or missing server `md5Checksum`).
+- **P2 ComfyUI Headless Optional Exclusions & `py313` Wheelhouse (`h3_comfyui_cache.py`, `h3_remote_worker.py`)**:
+  - Source-audited pinned ComfyUI commit
+    `61e524bdba7a4e193b45c2697f1af83c1beb86d6` (`server.py` +
+    `app/frontend_management.py`): excluded 100%-optional headless UI asset
+    packages (`comfyui-workflow-templates`, `comfyui-workflow-templates-*`,
+    `comfyui-embedded-docs`) while retaining `comfyui-frontend-package` (which
+    calls `sys.exit(-1)` on `ImportError`).
+  - Added `manylinux_2_28_x86_64` to `DEFAULT_PLATFORMS` (required by
+    `av>=17.0.0`, supported by Colab glibc 2.35), enhanced
+    `h3_comfyui_cache.py verify` for remote-only synced Drive entries, and
+    built/published a `py313` headless wheelhouse (`243.6 MB`, `72` wheels —
+    69.4% smaller than `py312`'s `834.7 MB`) alongside `py312`.
+- **P3 Monotonic `MODELS_READY` Backfill & SLA Calibration (`h3_controller.py`, `h3_reliability.py`)**:
+  - Monotonically backfills `MODELS_READY` in `h3_controller.py` when remote
+    polling observes `INFERENCE_RUNNING`/`INFERENCE_COMPLETED`/`VIDEO_READY` or
+    `coldstart_metrics` before a separate `MODELS_READY` poll arrived.
+  - Calibrated `h3_reliability.py::_evaluate_run_f()` so condition (2) is
+    satisfied by `MODELS_READY`, audit `COLDSTART_METRICS`, or monotonic
+    `WORKER_STARTED -> INFERENCE_COMPLETED -> VIDEO_VALIDATED` completion while
+    keeping incomplete runs failing closed.
+
 ## v0.2.0 — 2026-11-19 — Fast Cold-Start Engine (F1–F5)
 
 End-to-end cold-start acceleration across the Drive downloader, ComfyUI

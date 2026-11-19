@@ -220,6 +220,47 @@ class ColdstartTelemetryTest(unittest.TestCase):
             with mock.patch.object(ctrl, "run_cli", side_effect=RuntimeError("offline")):
                 self.assertIsNone(ctrl.download_remote_worker_log("sess-1", run_dir / "sub"))
 
+    def test_manifest_worker_state_backfills_models_ready_monotonically(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # Case 1: poll jumps from WORKER_STARTED -> INFERENCE_RUNNING
+            rm.create_run_manifest(root, "task-bf", "run-bf-1", variant="A")
+            rm.update_run(root, "run-bf-1", task_state="GPU_ALLOCATED",
+                          session_id="sess-1", session_state="ACTIVE")
+            rm.update_run(root, "run-bf-1", task_state="WORKER_STARTED")
+            with mock.patch.object(ctrl, "ROOT", root), \
+                 mock.patch.object(ctrl, "RUNS", root / "logs"):
+                # RESTORING_MODELS must NOT backfill MODELS_READY
+                ctrl._manifest_worker_state("run-bf-1", {"stage": "RESTORING_MODELS"})
+                self.assertEqual(rm.load_run_manifest(root, "run-bf-1")["task_state"], "WORKER_STARTED")
+                # INFERENCE_RUNNING backfills MODELS_READY
+                ctrl._manifest_worker_state("run-bf-1", {"stage": "INFERENCE_RUNNING"})
+                self.assertEqual(rm.load_run_manifest(root, "run-bf-1")["task_state"], "MODELS_READY")
+                # Repeated INFERENCE_RUNNING does not create anomalies
+                ctrl._manifest_worker_state("run-bf-1", {"stage": "INFERENCE_RUNNING"})
+            anomalies = [e for e in rm.read_audit_log(root, "run-bf-1") if e["event"] == "ANOMALY"]
+            self.assertEqual(anomalies, [])
+
+            # Case 2: poll jumps directly from WORKER_STARTED -> INFERENCE_COMPLETED
+            rm.create_run_manifest(root, "task-bf", "run-bf-2", variant="A")
+            rm.update_run(root, "run-bf-2", task_state="GPU_ALLOCATED",
+                          session_id="sess-2", session_state="ACTIVE")
+            rm.update_run(root, "run-bf-2", task_state="WORKER_STARTED")
+            with mock.patch.object(ctrl, "ROOT", root), \
+                 mock.patch.object(ctrl, "RUNS", root / "logs"):
+                ctrl._manifest_worker_state("run-bf-2", {"stage": "INFERENCE_COMPLETED"})
+                # A subsequent poll with coldstart_metrics must NOT try backward move
+                ctrl._manifest_worker_state("run-bf-2", {
+                    "stage": "VIDEO_READY",
+                    "coldstart_metrics": _sample_coldstart_metrics(),
+                })
+            stages = [e["detail"]["to"] for e in rm.read_audit_log(root, "run-bf-2") if e["event"] == "STAGE"]
+            self.assertIn("MODELS_READY", stages)
+            self.assertIn("INFERENCE_COMPLETED", stages)
+            self.assertLess(stages.index("MODELS_READY"), stages.index("INFERENCE_COMPLETED"))
+            anomalies2 = [e for e in rm.read_audit_log(root, "run-bf-2") if e["event"] == "ANOMALY"]
+            self.assertEqual(anomalies2, [])
+
 
 if __name__ == "__main__":
     unittest.main()

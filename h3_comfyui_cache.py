@@ -69,9 +69,20 @@ DEFAULT_EXCLUDED_PACKAGES: tuple[str, ...] = (
     "torchvision",
     "torchaudio",
     "triton",
+    # Headless ComfyUI API mode (--listen 127.0.0.1 --port 8188):
+    # Verified optional in ComfyUI commit 61e524bdba7a4e193b45c2697f1af83c1beb86d6
+    # (app/frontend_management.py catches ImportError and returns None;
+    # server.py skips /templates and /docs cleanly).
+    # comfyui-frontend-package is intentionally KEPT (default_frontend_path calls sys.exit(-1)).
+    "comfyui-workflow-templates",
+    "comfyui-embedded-docs",
 )
-DEFAULT_EXCLUDED_PREFIXES: tuple[str, ...] = ("nvidia-",)
+DEFAULT_EXCLUDED_PREFIXES: tuple[str, ...] = (
+    "nvidia-",
+    "comfyui-workflow-templates-",
+)
 DEFAULT_PLATFORMS: tuple[str, ...] = (
+    "manylinux_2_28_x86_64",
     "manylinux2014_x86_64",
     "manylinux_2_17_x86_64",
     "linux_x86_64",
@@ -886,7 +897,7 @@ def publish_wheelhouse(
 
 def verify(colab_auth: str) -> dict:
     """Read-only: re-check the Drive cache files against the local manifest."""
-    from drive_api import verify_uploaded_file
+    from drive_api import get_file_evidence, verify_uploaded_file
     from drive_depot import account_matches, drive_service
 
     if not LOCAL_MANIFEST.exists():
@@ -897,11 +908,29 @@ def verify(colab_auth: str) -> dict:
         raise RuntimeError("ACCOUNT_MISMATCH")
     result = {"folder_id": manifest.get("drive_folder_id"), "files": {}}
     for rel, info in manifest.get("drive_files", {}).items():
-        proof = verify_uploaded_file(
-            service, info["id"], STAGING / rel)
-        result["files"][rel] = {
-            "drive_file_id": info["id"], "size": proof["size"],
-            "sha256": proof["sha256"], "server_verified": True}
+        local_path = STAGING / rel
+        if local_path.is_file():
+            proof = verify_uploaded_file(service, info["id"], local_path)
+            result["files"][rel] = {
+                "drive_file_id": info["id"], "size": proof["size"],
+                "sha256": proof["sha256"], "server_verified": True}
+        else:
+            meta = get_file_evidence(service, info["id"])
+            if meta.get("trashed"):
+                raise RuntimeError(f"Drive file is trashed: {rel}")
+            if int(meta.get("size", -1)) != int(info["size"]):
+                raise RuntimeError(f"Server size mismatch for {rel}")
+            expected_md5 = str(info.get("server_md5", "")).strip().lower()
+            actual_md5 = str(meta.get("md5Checksum", "")).strip().lower()
+            if expected_md5 and actual_md5 != expected_md5:
+                raise RuntimeError(f"Drive server MD5 mismatch for {rel}")
+            server_sha = str(meta.get("sha256Checksum", "")).strip().lower()
+            expected_sha = str(info.get("sha256", "")).strip().lower()
+            if server_sha and expected_sha and server_sha != expected_sha:
+                raise RuntimeError(f"Drive server SHA256 mismatch for {rel}")
+            result["files"][rel] = {
+                "drive_file_id": info["id"], "size": int(meta["size"]),
+                "sha256": expected_sha, "server_verified": True}
     return result
 
 

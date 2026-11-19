@@ -124,12 +124,60 @@ class TestWheelhouseF2(unittest.TestCase):
             "triton==3.1.0",
             "nvidia-cublas-cu12>=12.1",
             "nvidia_nccl_cu12==2.20.5",
+            "comfyui-workflow-templates==0.9.10",
+            "comfyui-workflow-templates-media-video==0.3.20",
+            "comfyui-embedded-docs==0.4.3",
+            "comfyui-frontend-package==1.44.0",
             "einops>=0.7.0",
             "safetensors>=0.4.2",
             "aiohttp>=3.9",
         ]
         kept = w.filter_requirements_lines(lines)
-        self.assertEqual(kept, ["einops>=0.7.0", "safetensors>=0.4.2", "aiohttp>=3.9"])
+        self.assertEqual(
+            kept,
+            [
+                "comfyui-frontend-package==1.44.0",
+                "einops>=0.7.0",
+                "safetensors>=0.4.2",
+                "aiohttp>=3.9",
+            ],
+        )
+
+    def test_headless_exclusions_aligned_in_requirements_status_and_pip_install_needed(self):
+        # Verify verified headless exclusions are present and frontend-package is NEVER excluded.
+        self.assertIn("comfyui-workflow-templates", w.DEFAULT_EXCLUDED_PACKAGES)
+        self.assertIn("comfyui-embedded-docs", w.DEFAULT_EXCLUDED_PACKAGES)
+        self.assertIn("comfyui-workflow-templates-", w.DEFAULT_EXCLUDED_PREFIXES)
+        self.assertNotIn("comfyui-frontend-package", w.DEFAULT_EXCLUDED_PACKAGES)
+
+        # When only headless-excluded packages are absent, pip_install_needed is False.
+        req_only_excluded = self.base / "req_headless_ok.txt"
+        req_only_excluded.write_text(
+            "pip>=1\n"
+            "comfyui-workflow-templates==0.9.10\n"
+            "comfyui-workflow-templates-media-video==0.3.20\n"
+            "comfyui-embedded-docs==0.4.3\n",
+            encoding="utf-8",
+        )
+        status = w.log_requirements_status(req_only_excluded)
+        self.assertEqual(status["satisfied"], ["pip>=1"])
+        self.assertEqual(status["missing"], [])
+        self.assertEqual(status["unknown"], [])
+        self.assertEqual(len(status["excluded"]), 3)
+        self.assertFalse(w.pip_install_needed(req_only_excluded))
+
+        # comfyui-frontend-package is a hard requirement: if missing, pip_install_needed MUST be True.
+        req_missing_frontend = self.base / "req_missing_frontend.txt"
+        req_missing_frontend.write_text(
+            "pip>=1\n"
+            "comfyui-frontend-package==99.99.99\n"
+            "comfyui-embedded-docs==0.4.3\n",
+            encoding="utf-8",
+        )
+        status2 = w.log_requirements_status(req_missing_frontend)
+        self.assertEqual(len(status2["missing"]), 1)
+        self.assertIn("comfyui-frontend-package", status2["missing"][0])
+        self.assertTrue(w.pip_install_needed(req_missing_frontend))
 
     def test_wheelhouse_happy_path_offline_pip(self):
         tar_src = self.base / f"comfyui-wheelhouse-{self.commit}-{self.pytag}.tar.gz"
