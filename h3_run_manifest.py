@@ -249,7 +249,8 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
                last_error: str | None = None, artifacts: dict | None = None,
                budget: dict | None = None, heartbeat: bool = False,
                reopen: bool = False, bootstrap: dict | None = None,
-               transient_error: str | None = None) -> tuple[dict, bool, str | None]:
+               transient_error: str | None = None,
+               coldstart_metrics: dict | None = None) -> tuple[dict, bool, str | None]:
     """Idempotent update. Returns (manifest, applied, anomaly).
 
     - task_state moves forward only (by stage index); a backward move is
@@ -399,6 +400,21 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
             manifest["last_transient_error"] = record
             changed = True
 
+    if isinstance(coldstart_metrics, dict) and coldstart_metrics:
+        # v0.2.0 F5: structured coldstart telemetry emitted by the remote
+        # worker (COLDSTART_METRICS_JSON / job state). Idempotent merge.
+        current_cs = manifest.get("coldstart_metrics")
+        merged_cs = {**(current_cs if isinstance(current_cs, dict) else {}),
+                     **coldstart_metrics}
+        if merged_cs != current_cs:
+            manifest["coldstart_metrics"] = merged_cs
+            changed = True
+            record_audit_event(root, run_id, "COLDSTART_METRICS", {
+                "total_coldstart_sec": merged_cs.get("total_coldstart_sec"),
+                "wheelhouse_used": merged_cs.get("wheelhouse_used"),
+                "effective_download_mbps": merged_cs.get("effective_download_mbps"),
+            })
+
     if heartbeat or changed:
         manifest["last_heartbeat_utc"] = now
     if changed:
@@ -446,6 +462,7 @@ def recovery_view(root: Path, run_id: str) -> dict:
             # TASK-006 P1-B bootstrap + transient axis (v1/v2 default safely):
             "bootstrap": manifest.get("bootstrap") or {"steps": {}, "current_step": None},
             "last_transient_error": manifest.get("last_transient_error"),
+            "coldstart_metrics": manifest.get("coldstart_metrics"),
             "schema_version": manifest_schema_version(manifest)}
 
 

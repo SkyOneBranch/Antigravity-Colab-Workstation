@@ -34,6 +34,25 @@ Live end-to-end production run on `A100-SXM4-80GB` via `--task-spec config/tasks
 
 ---
 
+## Fast Cold-Start Engine (v0.2.0)
+
+- **F1 Zero-Copy High-Concurrency Drive Download ([`h3_drive_download.py`](h3_drive_download.py))**:
+  - Preallocates a single `.part` file (`os.truncate` + lock-free multi-threaded `os.pwrite`, peak disk `<= 1.0x`, zero `.shard*` temp files or merge pass) with `12` default concurrent workers (`H3_DRIVE_CONCURRENT_WORKERS` in `1..16`) and a process-wide Drive connection cap (`H3_DRIVE_MAX_GLOBAL_CONNECTIONS`, default `16`).
+  - Computes ordered in-flight streaming SHA-256 without re-reading completed files from disk, persists `.part.bitmap.json` for block-level resume, supports `abort_event` cancellation (`DriveDownloadAbortedError`), and provides single-flight `FileTokenProvider.refresh` under concurrent 401s.
+- **F2 Offline ComfyUI Wheelhouse Cache ([`h3_comfyui_cache.py`](h3_comfyui_cache.py), [`scripts/setup_isolated_account.py`](scripts/setup_isolated_account.py))**:
+  - `build-wheelhouse` and `publish-wheelhouse` package deterministic SHA-256-locked `comfyui-wheelhouse-<commit>-<pytag>.tar.gz` bundles targeting Colab Linux x86_64 (`py311`/`py312`) while excluding preinstalled heavy packages (`torch`, `torchvision`, `torchaudio`, `triton`, `nvidia-*`).
+  - `scripts/setup_isolated_account.py --sync-shared-caches` discovers and verifies commit-matching wheelhouse bundles across accounts alongside the source archive. The remote worker prefers offline `pip install --no-index --find-links=...` and emits `WHEELHOUSE_FALLBACK_PYPI` when falling back to PyPI.
+- **F3 Dual-Track Parallel Setup ([`h3_remote_worker.py`](h3_remote_worker.py))**:
+  - Runs `ensure_comfy()` and `restore_weights()` concurrently via `ThreadPoolExecutor(max_workers=2)` with a shared `abort_event`, thread-safe token refresh, and thread-safe state/failure recording so an error in either track cancels the other promptly and reports the exact failing stage.
+- **F4 Independent NVMe Model Store & High-VRAM Launch ([`h3_remote_worker.py`](h3_remote_worker.py))**:
+  - Downloads weights into `/content/nvme_models/h3` (overridable via `H3_NVME_MODELS_DIR`) and atomically symlinks verified weights into `/content/ComfyUI/models/` (`link_models_into_comfy`) after both tracks join.
+  - Detects GPU VRAM and appends `--highvram --disable-mmap` automatically when VRAM `>= 76800` MiB (A100 80GB / G4 96GB), overridable via `H3_COMFY_VRAM_FLAGS`.
+- **F5 In-Cloud Remote Seeding & Cold-Start Telemetry ([`drive_depot.py`](drive_depot.py), [`h3_controller.py`](h3_controller.py), [`h3_run_manifest.py`](h3_run_manifest.py), [`scripts/reliability_report.py`](scripts/reliability_report.py))**:
+  - `drive_depot.py remote-seed` (strictly gated by `--allow-drive-write --allow-large-transfer --confirm-remote-seed`) downloads locked Hugging Face weights in-cloud using a short-lived `drive.file` token under watchdog supervision, verifies SHA-256 remotely, and unconditionally enforces `colab stop` + tristate `STOPPED` verification in `finally`.
+  - Worker emits structured `COLDSTART_METRICS_JSON` (persisted in `model_cache/run_manifests/<run_id>.json`), summarized with cold-start P50/P90 phase latencies and `wheelhouse_hit_rate` by `scripts/reliability_report.py`.
+
+---
+
 ## Quickstart
 
 ### 1. Prerequisites & Environment
@@ -89,7 +108,7 @@ To invoke this workstation from **another project directory or Antigravity works
 
 ## Pinned Architecture & Contracts
 
-- **Compute & Storage**: Colab Enterprise/Pro A100-SXM4-80GB (`config/gpu_policy.yaml`), ~37 GB locked MiniMax-H3 safetensors from Drive Model Depot (`drive_depot.py`), reproducible ComfyUI install via pinned source + wheelhouse (`comfyui_cache.py`).
+- **Compute & Storage**: Colab Enterprise/Pro A100-SXM4-80GB (`config/gpu_policy.yaml`), ~37 GB locked MiniMax-H3 safetensors from Drive Model Depot (`drive_depot.py`), reproducible ComfyUI install via pinned source + offline wheelhouse (`h3_comfyui_cache.py`).
 - **Hard Budget Caps (`config/budget_policy.yaml`)**: `30.0 CU` per production task (`MAX_PRODUCTION_TASK_CU = 30.0`) and `25.0 CU` per single runtime session (`SESSION_STOP_CU = 25.0`).
 - **CLI Patches (`patches/google-colab-cli-0.7.5/`)**:
   - `proxy_post_body.patch` — preserves empty POST bodies across HTTP 411/400 Colab assign retry paths.

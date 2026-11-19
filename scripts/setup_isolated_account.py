@@ -430,9 +430,13 @@ def _discover_comfyui_cache(
     comfyui_folder_id: str | None = None,
     drive_cred_path: Path = DEFAULT_DRIVE_CRED,
 ) -> dict:
-    """Read-only sync of Muse-H3-ComfyUI-Source metadata (never downloads the tarball)."""
+    """Read-only sync of Muse-H3-ComfyUI-Source & wheelhouse metadata (never downloads tarballs)."""
     from drive_depot import FOLDER_MIME, atomic_json, drive_service
-    from h3_comfyui_cache import CACHE_FOLDER_NAME, LOCAL_MANIFEST as COMFY_LOCAL_MANIFEST
+    from h3_comfyui_cache import (
+        CACHE_FOLDER_NAME,
+        LOCAL_MANIFEST as COMFY_LOCAL_MANIFEST,
+        normalize_python_tag,
+    )
 
     _ensure_isolated_env(drive_cred_path)
     svc = drive_service()
@@ -463,7 +467,7 @@ def _discover_comfyui_cache(
 
     children = svc.files().list(
         q=f"'{folder_id}' in parents and trashed = false",
-        pageSize=20,
+        pageSize=100,
         fields="files(id,name,size,md5Checksum)",
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
@@ -496,7 +500,7 @@ def _discover_comfyui_cache(
         raise RuntimeError(f"ComfyUI cache tarball size mismatch for {archive_name}")
 
     manifest["drive_folder_id"] = folder_id
-    manifest["drive_files"] = {
+    drive_files = {
         archive_name: {
             "id": tar_meta["id"],
             "size": int(tar_meta["size"]),
@@ -516,6 +520,82 @@ def _discover_comfyui_cache(
             "server_md5": manifest_meta.get("md5Checksum", ""),
         },
     }
+
+    # Discover and verify optional offline wheelhouse bundles for the pinned commit.
+    wheelhouses: dict[str, dict] = {}
+    wheelhouse_summary: dict[str, dict] = {}
+    wh_manifest_metas = sorted(
+        (
+            item
+            for item in children
+            if str(item.get("name", "")).startswith("comfyui-wheelhouse-")
+            and str(item.get("name", "")).endswith(".manifest.json")
+        ),
+        key=lambda item: item["name"],
+    )
+    for wh_manifest_meta in wh_manifest_metas:
+        wh_manifest_bytes = _download_drive_bytes(svc, wh_manifest_meta["id"])
+        wh_manifest = json.loads(wh_manifest_bytes.decode("utf-8"))
+        if wh_manifest.get("commit") != manifest["commit"]:
+            continue
+        wh_archive_name = wh_manifest.get("archive_name") or wh_manifest.get("filename")
+        if not wh_archive_name:
+            raise RuntimeError(f"Wheelhouse manifest {wh_manifest_meta['name']} missing archive_name")
+        wh_sha_name = f"{wh_archive_name}.sha256"
+        wh_tar_meta = by_name.get(wh_archive_name)
+        wh_sha_meta = by_name.get(wh_sha_name)
+        if not wh_tar_meta or not wh_sha_meta:
+            raise RuntimeError(
+                f"Wheelhouse cache incomplete in Drive: missing {wh_archive_name} or {wh_sha_name}"
+            )
+        wh_sha_bytes = _download_drive_bytes(svc, wh_sha_meta["id"])
+        wh_sha_hex = wh_sha_bytes.decode("utf-8").strip().split()[0].lower()
+        if wh_sha_hex != str(wh_manifest.get("sha256", "")).lower():
+            raise RuntimeError(
+                f"Wheelhouse cache sha256 mismatch between manifest and {wh_sha_name}"
+            )
+        if int(wh_tar_meta["size"]) != int(wh_manifest["size_bytes"]):
+            raise RuntimeError(f"Wheelhouse cache tarball size mismatch for {wh_archive_name}")
+
+        pytag = normalize_python_tag(wh_manifest["python_tag"])
+        wheelhouses[pytag] = {
+            **wh_manifest,
+            "archive_name": wh_archive_name,
+            "python_tag": pytag,
+            "size_bytes": int(wh_tar_meta["size"]),
+            "file_id": wh_tar_meta["id"],
+            "server_md5": wh_tar_meta.get("md5Checksum", ""),
+            "sha256_file_id": wh_sha_meta["id"],
+            "manifest_file_id": wh_manifest_meta["id"],
+        }
+        drive_files[wh_archive_name] = {
+            "id": wh_tar_meta["id"],
+            "size": int(wh_tar_meta["size"]),
+            "sha256": wh_manifest["sha256"],
+            "server_md5": wh_tar_meta.get("md5Checksum", ""),
+        }
+        drive_files[wh_sha_name] = {
+            "id": wh_sha_meta["id"],
+            "size": int(wh_sha_meta["size"]),
+            "sha256": hashlib.sha256(wh_sha_bytes).hexdigest(),
+            "server_md5": wh_sha_meta.get("md5Checksum", ""),
+        }
+        drive_files[wh_manifest_meta["name"]] = {
+            "id": wh_manifest_meta["id"],
+            "size": int(wh_manifest_meta["size"]),
+            "sha256": hashlib.sha256(wh_manifest_bytes).hexdigest(),
+            "server_md5": wh_manifest_meta.get("md5Checksum", ""),
+        }
+        wheelhouse_summary[pytag] = {
+            "file_id": wh_tar_meta["id"],
+            "archive_name": wh_archive_name,
+            "commit": wh_manifest["commit"],
+            "size_bytes": int(wh_tar_meta["size"]),
+        }
+
+    manifest["drive_files"] = drive_files
+    if wheelhouses:
+        manifest["wheelhouses"] = wheelhouses
     atomic_json(COMFY_LOCAL_MANIFEST, manifest)
     os.chmod(COMFY_LOCAL_MANIFEST, 0o600)
     return {
@@ -524,6 +604,7 @@ def _discover_comfyui_cache(
         "archive_file_id": tar_meta["id"],
         "commit": manifest["commit"],
         "size_bytes": int(tar_meta["size"]),
+        "wheelhouses": wheelhouse_summary,
     }
 
 
