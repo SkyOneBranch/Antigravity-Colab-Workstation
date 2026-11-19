@@ -34,6 +34,22 @@ Live end-to-end production run on `A100-SXM4-80GB` via `--task-spec config/tasks
 
 ---
 
+## Self-Healing & Controlled Warm Pool (v0.3.0)
+
+- **M1 GPU 503 Elastic Backoff & Error Classification (`h3_budget.py`, `h3_controller.py`)**:
+  - Classifies Colab allocation errors into `AUTH_FATAL`, `QUOTA_EXCEEDED`, `CAPACITY_TRANSIENT` (HTTP 503/412/capacity), `TRANSPORT_TRANSIENT`, and `UNKNOWN_FATAL`.
+  - Wraps the `("G4", "G4", "A100_HIGH_MEM")` allocation plan in `--allocation-rounds <1..5>` (default `3` for `deliver` / `--auto-recover`, `1` for raw `run`) with jittered backoff (`15s / 45s / 90s ±20%`), deadline-margin gating, and fail-fast on fatal/quota errors.
+- **M2 Two-Stage Bundled Bootstrap (`h3_bootstrap_stage1.py`, `h3_bootstrap_stage2.py`, `h3_controller.py`)**:
+  - `--bootstrap-mode bundled` (default; `legacy` preserves the 7-step per-file path) uploads Stage 1 (`0600` downscoped tokens + Drive download probe, never `h3_remote_worker.py`) and only builds/uploads Stage 2 (`h3_remote_worker.py` + `task.json`) after `MUSE_DRIVE_DOWNLOAD_PROBE_OK`, with strict path-traversal rejection and `bootstrap` round-trip telemetry in the run manifest.
+- **M3 Host Disconnect Self-Healing & Drive 0-GPU Recovery (`h3_controller.py`, `h3_drive_token.py`)**:
+  - Wraps live host control-plane calls in transient network/TLS retry (`5x`: `5/10/20/30s`) and checks preflight OAuth token freshness (`>= 900s` remaining, silent refresh at `0 CU`).
+  - On host crash after the remote GPU has already stopped, `--deliver` / `--auto-recover` runs `recover_from_drive_archive()` at **0 CU** to fetch the archived MP4 from `Muse-H3-Video-Outputs`, validate it locally, and transition the manifest to `TASK_COMPLETED`.
+- **M4 Controlled Warm Session Pool (`--keep-warm-ttl`, `h3_gpu_lease_registry.py`, `h3_shutdown_executor.py`, `scripts/verify_shutdown.sh`)**:
+  - Pass `--keep-warm-ttl <60..900>` (`0` disables, default) to keep a healthy ComfyUI `:8188` session warm after delivery under `MAX_SESSION_SECONDS (14400s)` and `PER_SESSION_BUDGET_CU (25.0 CU)` caps. Subsequent runs reuse the warm session (`warm_session_reused: true`, `< 5s` cold-start) after `:8188` health verification.
+  - On any failure, the session is stopped immediately. Expired warm leases are reclaimed unconditionally across tasks by `scripts/run_shutdown_guardian.py`, or immediately on demand via `./scripts/verify_shutdown.sh --stop-warm` (default `./scripts/verify_shutdown.sh` remains 100% read-only).
+
+---
+
 ## Fast Cold-Start Engine (v0.2.0 / v0.2.1)
 
 - **F1 Zero-Copy High-Concurrency Drive Download ([`h3_drive_download.py`](h3_drive_download.py))**:
@@ -87,18 +103,19 @@ Optional on macOS: install the background `launchd` shutdown guardian:
 ./scripts/preflight.sh --task-spec config/tasks/shao_nian_v1_A.json
 
 # macOS: keep host awake during remote execution + Drive archival
+# Optional v0.3.0 flags: --allocation-rounds 3 --bootstrap-mode bundled --keep-warm-ttl 300
 /usr/bin/caffeinate -dimsu ./scripts/run_h3_task.sh \
   --confirm-live \
   --task-spec config/tasks/shao_nian_v1_A.json \
   --production-task-id shao-nian-agy-001 \
   --authorize-new-task \
-  --deliver \
-  --auto-recover
+  --deliver
 
 ./scripts/check_outputs.sh output/<run_id>/shao_nian_v1.mp4 \
   --task-spec config/tasks/shao_nian_v1_A.json
 
-./scripts/verify_shutdown.sh
+./scripts/verify_shutdown.sh            # read-only check (sessions == [], rate == 0.0)
+# ./scripts/verify_shutdown.sh --stop-warm  # reclaim warm-idle sessions + verify stopped
 ./scripts/check_budget.sh
 ```
 

@@ -24,7 +24,7 @@ description: Standard macOS Antigravity execution workflow for colab-workstation
    ./scripts/preflight.sh --task-spec config/tasks/<task_id>.json
    ```
    确认 `adc_valid`、`colab_oauth_token_valid`、`same_account_and_drive_ready`、`drive_download_preflight`、`drive_file_token_archive` 等全项全绿才允许进入实跑。
-3. **防休眠受管交付（`caffeinate` + `--deliver`）**：
+3. **防休眠受管交付（`caffeinate` + `--deliver`，支持 v0.3.0 自愈与温池）**：
    ```bash
    /usr/bin/caffeinate -dimsu ./scripts/run_h3_task.sh \
      --confirm-live --deliver \
@@ -32,11 +32,20 @@ description: Standard macOS Antigravity execution workflow for colab-workstation
      --authorize-new-task \
      --task-spec config/tasks/<task_id>.json \
      --max-task-attempts 2 \
+     --allocation-rounds 3 \
+     --bootstrap-mode bundled \
      --task-deadline-utc <ISO8601_UTC>
    ```
-4. **异步等待与验收**：使用后台异步等待（Reactive Wakeup，不在循环中轮询），完成后运行：
+   - **批量连跑温池复用（可选 `--keep-warm-ttl <60..900>`）**：仅在连续提交多个任务时追加 `--keep-warm-ttl 300`（`0` 关闭，合法区间 `60..900` 秒）。任务成功后在 `25.0 CU` 单会话预算与 `14400s` 生命周期内保留 `:8188` ComfyUI 温态供下一任务秒级复用；任何失败均立即 fail-closed 停机。
+   - **宿主机断连 0-GPU 自愈**：若宿主机中断而远端 GPU 已停机且成片已归档至 Google Drive，再次执行 `--deliver`（或 `--auto-recover`）会自动走 `recover_from_drive_archive()` 以 **0 CU** 拉回并验收成片。
+4. **异步等待与验收 / 温池清理**：使用后台异步等待（Reactive Wakeup，不在循环中轮询），完成后运行：
    ```bash
    ./scripts/check_outputs.sh <path/to/final.mp4>
    ./scripts/verify_shutdown.sh
    ```
-   确认成片 MD5 持久化、本地 QA 通过、且 GPU 会话三态确认为 `STOPPED`。
+   确认成片 MD5 持久化、本地 QA 通过、且 GPU 会话确认为 `sessions: []` 且 `rate: 0.0`。
+   - 若本批次启用了 `--keep-warm-ttl` 且所有连跑任务已结束，**必须立即显式回收温池会话并验证停机**：
+     ```bash
+     ./scripts/verify_shutdown.sh --stop-warm
+     ```
+     （默认 `./scripts/verify_shutdown.sh` 保持 100% 只读；`--stop-warm` 会先跨任务回收全部 `warm_idle` 租约，再执行只读 `check` 断言 `sessions == []` 且 `rate == 0.0`。）

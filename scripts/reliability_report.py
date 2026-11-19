@@ -115,6 +115,13 @@ def compute_coldstart_summary(root: str | Path,
     wh_hits = sum(1 for b in wh_bools if b)
     wh_rate = round(wh_hits / len(wh_bools), 4) if wh_bools else None
 
+    warm_hits = sum(
+        1 for m in manifests
+        if (m.get("coldstart_metrics") or {}).get("warm_session_reused") is True
+        or (m.get("artifacts") or {}).get("warm_session_reused") is True
+    )
+    warm_hit_rate = round(warm_hits / len(manifests), 4) if manifests else None
+
     total_stats = percentiles_map["total_coldstart_sec"]
     return {
         "sample_size": n,
@@ -125,6 +132,8 @@ def compute_coldstart_summary(root: str | Path,
         "wheelhouse_hits": wh_hits,
         "wheelhouse_samples": len(wh_bools),
         "wheelhouse_hit_rate": wh_rate,
+        "warm_session_hits": warm_hits,
+        "warm_session_hit_rate": warm_hit_rate,
         "percentiles": percentiles_map,
     }
 
