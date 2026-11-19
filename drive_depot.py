@@ -14,7 +14,7 @@ DOES NOT attempt to read the historic other-app H3 cache, which may be invisible
 under drive.file scope even for the same human Google account.
 """
 from __future__ import annotations
-import argparse, datetime as dt, hashlib, json, os, re, shutil, subprocess, sys, time
+import argparse, datetime as dt, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
 from auth_support import ensure_adc_isolation, resolve_colab_executable
 from pathlib import Path
 from h3_contract import MODEL_FILES, sha256_file
@@ -28,6 +28,10 @@ STATE=DEPOT_DIR/'depot_state.json'
 HF_REPO='Comfy-Org/MiniMax-H3'
 HF_RESOLVE_BASE='https://huggingface.co'
 PIN_FILE=DEPOT_DIR/'pinned_hf_files.json'
+CONFIG_PIN_FILE=ROOT/'config'/'pinned_hf_files.json'
+REMOTE_SEED_DIR='/content/muse_remote_seed'
+REMOTE_SEED_MARKER='REMOTE_SEED_RESULT_JSON:'
+REMOTE_SEED_DEFAULT_WALL_SEC=1800
 DIRECT_CHUNK=1024*1024  # 1 MiB streaming writes
 DIRECT_MAX_ATTEMPTS=3
 DIRECT_CONNECT_TIMEOUT=30  # seconds
@@ -513,20 +517,574 @@ def smoke(service,root_id:str)->dict:
             'size':entry['size'],'server_md5_verified':True,'no_gpu_created':True}
 
 
+def load_remote_seed_pin(pin_path:Path=CONFIG_PIN_FILE,revision:str='')->dict:
+    """Load and validate locked HF model files for remote-seed (v0.2.0 F5).
+
+    Validates repo, 40-hex commit revision (and exact match with --hf-revision
+    when provided), and all 4 required model files with positive byte sizes and
+    64-hex SHA-256 digests.
+    """
+    path=Path(pin_path)
+    if not path.is_file():
+        raise FileNotFoundError(f'Pinned HF manifest not found: {path}')
+    pin=read_json(path)
+    if not isinstance(pin,dict):
+        raise ValueError('Pinned HF manifest must be a JSON object')
+    if pin.get('repo')!=HF_REPO:
+        raise ValueError(f"Pinned HF repo mismatch: expected {HF_REPO!r}, got {pin.get('repo')!r}")
+    pin_rev=str(pin.get('revision') or '')
+    if not re.fullmatch('[0-9a-f]{40}',pin_rev):
+        raise ValueError('Pinned HF revision must be a 40-char lowercase hex commit SHA')
+    if revision and revision!=pin_rev:
+        raise ValueError(f'--hf-revision {revision} does not match pinned revision {pin_rev}')
+    files=pin.get('files')
+    if not isinstance(files,dict) or set(REQUIRED)-set(files):
+        missing=sorted(set(REQUIRED)-set(files or {}))
+        raise ValueError('Pinned HF manifest missing required files: '+repr(missing))
+    validated={}
+    for rel in REQUIRED:
+        meta=files[rel]
+        if not isinstance(meta,dict):
+            raise ValueError('Invalid pinned file entry for '+rel)
+        size=meta.get('size')
+        sha=str(meta.get('sha256') or '').lower()
+        if not isinstance(size,int) or isinstance(size,bool) or size<=0:
+            raise ValueError('Invalid pinned size for '+rel)
+        if not re.fullmatch('[0-9a-f]{64}',sha):
+            raise ValueError('Invalid pinned SHA-256 for '+rel)
+        validated[rel]={'size':size,'sha256':sha,'lfs':bool(meta.get('lfs',True))}
+    return {'repo':HF_REPO,'revision':pin_rev,'files':validated}
+
+
+def parse_remote_seed_result(text:str)->dict:
+    """Extract REMOTE_SEED_RESULT_JSON from remote worker stdout."""
+    for line in (text or '').splitlines():
+        idx=line.find(REMOTE_SEED_MARKER)
+        if idx>=0:
+            raw=line[idx+len(REMOTE_SEED_MARKER):].strip()
+            obj=json.loads(raw)
+            if isinstance(obj,dict):
+                return obj
+    raise RuntimeError('Remote seed worker did not emit REMOTE_SEED_RESULT_JSON')
+
+
+def build_remote_seed_script()->str:
+    """Return a self-contained stdlib-only Python script executed inside the
+    temporary Colab session for in-cloud HF -> Drive Depot seeding (v0.2.0 F5).
+
+    Security & integrity invariants:
+    - Reads short-lived drive.file token from REMOTE_SEED_DIR/drive_token.json
+      and unlinks the token file immediately.
+    - Never prints tokens or signed CDN URLs.
+    - Downloads concurrently via aria2c (when selected/available) or built-in
+      multi-threaded HTTP Range + os.pwrite (falling back to single-stream on
+      HTTP 200).
+    - Verifies exact byte size + SHA-256 before uploading to Drive.
+    - Reuses an existing Drive file only on exact size + checksum match; never
+      overwrites mismatched data.
+    - Deletes staged files after upload to keep Colab disk bounded.
+    """
+    return '''#!/usr/bin/env python3
+from __future__ import annotations
+import concurrent.futures, hashlib, json, math, os, shutil, subprocess, sys, time, urllib.parse, urllib.request
+from pathlib import Path
+
+WORK = Path("/content/muse_remote_seed")
+SPEC_PATH = WORK / "seed_spec.json"
+TOKEN_PATH = WORK / "drive_token.json"
+DRIVE_API = "https://www.googleapis.com/drive/v3/files"
+DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
+UPLOAD_CHUNK = 16 * 1024 * 1024
+RANGE_WORKERS = 12
+RANGE_BLOCK = 32 * 1024 * 1024
+
+
+def _load_and_unlink_token() -> str:
+    doc = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+    try:
+        TOKEN_PATH.unlink()
+    except OSError:
+        pass
+    tok = doc.get("access_token") or ""
+    if not tok:
+        raise RuntimeError("Missing short-lived token in remote seed session")
+    return tok
+
+
+def _drive_json(url: str, token: str, method: str = "GET", body: bytes | None = None,
+                headers: dict | None = None, timeout: int = 120) -> tuple[int, dict, dict]:
+    hdrs = {"Authorization": f"Bearer {token}"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        return resp.status, dict(resp.headers.items()), json.loads(raw.decode("utf-8")) if raw else {}
+
+
+def _list_existing(token: str, folder_id: str, name: str) -> list[dict]:
+    safe = name.replace("\\\\", "\\\\\\\\").replace("'", "\\\\'")
+    q = f"'{folder_id}' in parents and name = '{safe}' and trashed = false"
+    qs = urllib.parse.urlencode({
+        "q": q, "spaces": "drive", "pageSize": "10",
+        "fields": "files(id,name,size,md5Checksum,sha256Checksum,parents)",
+        "supportsAllDrives": "true", "includeItemsFromAllDrives": "true",
+    })
+    _, _, data = _drive_json(f"{DRIVE_API}?{qs}", token)
+    return data.get("files", [])
+
+
+def _file_digests(path: Path) -> tuple[int, str, str]:
+    h_sha = hashlib.sha256()
+    h_md5 = hashlib.md5()
+    total = 0
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            h_sha.update(chunk)
+            h_md5.update(chunk)
+    return total, h_sha.hexdigest(), h_md5.hexdigest()
+
+
+def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
+    view = memoryview(data)
+    written = 0
+    while written < len(view):
+        n = os.pwrite(fd, view[written:], offset + written)
+        if n <= 0:
+            raise OSError("short pwrite")
+        written += n
+
+
+def _download_range_concurrent(url: str, dest: Path, expected_size: int) -> str:
+    part = Path(str(dest) + ".part")
+    fd = os.open(str(part), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        os.truncate(fd, expected_size)
+        block = min(RANGE_BLOCK, max(1024 * 1024, math.ceil(expected_size / RANGE_WORKERS)))
+        ranges = []
+        off = 0
+        while off < expected_size:
+            end = min(expected_size - 1, off + block - 1)
+            ranges.append((off, end))
+            off = end + 1
+
+        def _fetch(span: tuple[int, int]) -> None:
+            start, end = span
+            for attempt in range(3):
+                try:
+                    req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end}"})
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        if resp.status == 200 and start == 0:
+                            raise ValueError("NO_RANGE_SUPPORT")
+                        if resp.status != 206:
+                            raise RuntimeError(f"HTTP {resp.status} for range")
+                        pos = start
+                        while True:
+                            buf = resp.read(1024 * 1024)
+                            if not buf:
+                                break
+                            _pwrite_all(fd, buf, pos)
+                            pos += len(buf)
+                        if pos != end + 1:
+                            raise RuntimeError("Short range read")
+                        return
+                except ValueError:
+                    raise
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2 * (attempt + 1))
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(RANGE_WORKERS, len(ranges))) as ex:
+                list(ex.map(_fetch, ranges))
+            os.fsync(fd)
+        except ValueError:
+            os.close(fd)
+            fd = -1
+            part.unlink(missing_ok=True)
+            with urllib.request.urlopen(url, timeout=300) as resp, part.open("wb") as out:
+                while True:
+                    buf = resp.read(1024 * 1024)
+                    if not buf:
+                        break
+                    out.write(buf)
+            os.replace(part, dest)
+            return "single_stream"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    os.replace(part, dest)
+    return "range_pwrite"
+
+
+def _download_hf(url: str, dest: Path, expected_size: int, strategy: str) -> str:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    use_aria2 = strategy == "aria2c" or (strategy == "auto" and shutil.which("aria2c") is not None)
+    if use_aria2:
+        cmd = [
+            "aria2c", "-x", "16", "-s", "16", "-k", "1M",
+            "--file-allocation=none", "--allow-overwrite=true",
+            "--console-log-level=warn", "--summary-interval=0",
+            "-d", str(dest.parent), "-o", dest.name, url,
+        ]
+        subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, timeout=1800)
+        return "aria2c"
+    return _download_range_concurrent(url, dest, expected_size)
+
+
+def _upload_resumable(token: str, source: Path, folder_id: str, name: str, rel: str, revision: str, sha: str) -> dict:
+    size = source.stat().st_size
+    meta = {
+        "name": name,
+        "parents": [folder_id],
+        "appProperties": {"muse_rel": rel, "hf_revision": revision, "sha256": sha},
+    }
+    init_qs = urllib.parse.urlencode({
+        "uploadType": "resumable",
+        "supportsAllDrives": "true",
+        "fields": "id,name,size,md5Checksum,sha256Checksum,parents",
+    })
+    init_req = urllib.request.Request(
+        f"{DRIVE_UPLOAD}?{init_qs}",
+        data=json.dumps(meta).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "application/octet-stream",
+            "X-Upload-Content-Length": str(size),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(init_req, timeout=120) as resp:
+        upload_url = resp.headers.get("Location") or resp.headers.get("location")
+    if not upload_url:
+        raise RuntimeError("Drive resumable upload init returned no Location")
+    offset = 0
+    with source.open("rb") as f:
+        while offset < size:
+            chunk = f.read(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            end = offset + len(chunk) - 1
+            put_req = urllib.request.Request(
+                upload_url,
+                data=chunk,
+                headers={
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{size}",
+                    "Content-Type": "application/octet-stream",
+                },
+                method="PUT",
+            )
+            try:
+                with urllib.request.urlopen(put_req, timeout=300) as resp:
+                    if resp.status in (200, 201):
+                        return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                if e.code == 308:
+                    offset = end + 1
+                    continue
+                raise
+            offset = end + 1
+    raise RuntimeError("Resumable upload ended without Drive response for " + rel)
+
+
+def main() -> int:
+    spec = json.loads(SPEC_PATH.read_text(encoding="utf-8"))
+    token = _load_and_unlink_token()
+    repo = spec["repo"]
+    revision = spec["revision"]
+    strategy = spec.get("downloader", "auto")
+    stage_dir = WORK / "stage"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for item in spec["files"]:
+        rel = item["path"]
+        name = item["name"]
+        folder_id = item["folder_id"]
+        expected_size = int(item["size"])
+        expected_sha = str(item["sha256"]).lower()
+        existing = _list_existing(token, folder_id, name)
+        if len(existing) > 1:
+            raise RuntimeError("Duplicate Drive filenames for " + rel)
+        if existing:
+            meta = existing[0]
+            srv_sha = (meta.get("sha256Checksum") or "").lower()
+            if int(meta.get("size", -1)) != expected_size or (srv_sha and srv_sha != expected_sha):
+                raise RuntimeError("Existing Drive file differs; DO NOT overwrite: " + rel)
+            entries.append({
+                "path": rel, "drive_file_id": meta["id"], "parent_id": folder_id,
+                "size": expected_size, "sha256": expected_sha,
+                "server_md5": meta.get("md5Checksum", ""),
+                "server_verified": True, "hf_revision": revision, "method": "reused_drive",
+            })
+            continue
+        url = f"https://huggingface.co/{repo}/resolve/{revision}/{rel}"
+        local = stage_dir / name
+        method = _download_hf(url, local, expected_size, strategy)
+        actual_size, actual_sha, actual_md5 = _file_digests(local)
+        if actual_size != expected_size or actual_sha.lower() != expected_sha:
+            local.unlink(missing_ok=True)
+            raise RuntimeError("Remote HF checksum/size mismatch for " + rel)
+        uploaded = _upload_resumable(token, local, folder_id, name, rel, revision, expected_sha)
+        local.unlink(missing_ok=True)
+        if int(uploaded.get("size", -1)) != expected_size or (uploaded.get("md5Checksum") or "").lower() != actual_md5.lower():
+            raise RuntimeError("Uploaded Drive checksum/size mismatch for " + rel)
+        entries.append({
+            "path": rel, "drive_file_id": uploaded["id"], "parent_id": folder_id,
+            "size": expected_size, "sha256": expected_sha,
+            "server_md5": uploaded["md5Checksum"],
+            "server_verified": True, "hf_revision": revision, "method": method,
+        })
+    print("REMOTE_SEED_RESULT_JSON:" + json.dumps({"revision": revision, "files": entries}, ensure_ascii=False), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def _run_remote_seed_cli(cmd:list[str],colab_auth:str,timeout:int=180,check:bool=True)->dict:
+    exe=resolve_colab_executable()
+    env={**os.environ,'REQUEST_TIMEOUT':'120','COLAB_CLI_REQUEST_TIMEOUT':'180'}
+    proc=subprocess.run([exe,'--auth='+colab_auth,*cmd],capture_output=True,text=True,
+                        stdin=subprocess.DEVNULL,timeout=timeout,check=False,env=env)
+    res={'args':cmd,'returncode':proc.returncode,'stdout':proc.stdout or '','stderr':proc.stderr or ''}
+    if check and proc.returncode!=0:
+        raise RuntimeError('Colab CLI failed: '+str(cmd)+' rc='+str(proc.returncode))
+    return res
+
+
+def _wait_remote_seed_watchdog(proc,ready_path:Path,session:str,timeout_sec:float=15.0)->dict:
+    deadline=time.monotonic()+timeout_sec
+    while time.monotonic()<deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f'WATCHDOG_NOT_RUNNING: watchdog exited ({proc.returncode}) for {session}')
+        if ready_path.exists():
+            try:
+                ready=json.loads(ready_path.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+            else:
+                if ready.get('session_id')==session:
+                    return ready
+                raise RuntimeError(f'WATCHDOG_NOT_RUNNING: readiness mismatch for {session}')
+        time.sleep(0.25)
+    raise RuntimeError(f'WATCHDOG_NOT_RUNNING: watchdog did not signal readiness for {session}')
+
+
+def _stop_and_verify_remote_seed_session(session:str,colab_auth:str,run_cli_fn=None,
+                                         query_state_fn=None,mark_stopped_fn=None)->dict:
+    """Stop temporary remote-seed Colab session and verify STOPPED tristate."""
+    from h3_session_watchdog import SessionState,mark_session_stopped,query_session_state
+
+    cli_fn=run_cli_fn or _run_remote_seed_cli
+    q_fn=query_state_fn or query_session_state
+    mark_fn=mark_stopped_fn or mark_session_stopped
+    stop_ok=False
+    last_state=SessionState.UNKNOWN
+    for _ in range(3):
+        try:
+            state=q_fn(session,colab_auth=colab_auth)
+            last_state=state
+            if state is SessionState.STOPPED:
+                stop_ok=True
+                break
+            if state is SessionState.ACTIVE:
+                cli_fn(['stop','-s',session],colab_auth,timeout=65,check=False)
+                state=q_fn(session,colab_auth=colab_auth)
+                last_state=state
+                if state is SessionState.STOPPED:
+                    stop_ok=True
+                    break
+        except Exception:
+            pass
+        time.sleep(2)
+    record_marked=False
+    if stop_ok:
+        try:
+            record_marked=bool(mark_fn(session,SessionState.STOPPED))
+        except Exception:
+            record_marked=False
+    return {'session':session,'stopped_confirmed':stop_ok,'state':last_state.value,
+            'record_marked':record_marked}
+
+
+def remote_seed(service,root_id:str,pin_path:Path=CONFIG_PIN_FILE,revision:str='',
+                colab_auth:str='oauth2',max_wall_sec:int=REMOTE_SEED_DEFAULT_WALL_SEC,
+                downloader:str='auto',gpu_type:str='',
+                run_cli_fn=None,mint_file_token_fn=None,
+                record_session_fn=None,confirm_active_fn=None,
+                start_watchdog_fn=None,stop_verify_fn=None)->dict:
+    """In-cloud HF -> Drive Depot seeding via a watchdog-protected temporary
+    Colab session (v0.2.0 F5).
+
+    Always enforces colab stop + tristate shutdown verification in a finally
+    block. Terminates the watchdog only after a confirmed STOPPED verdict.
+    Never passes long-lived ADC credentials to Colab (only a short-lived
+    drive.file token).
+    """
+    import h3_drive_token
+    from h3_session_watchdog import confirm_session_active,record_session
+
+    if downloader not in ('auto','aria2c','range'):
+        raise ValueError("downloader must be 'auto', 'aria2c', or 'range'")
+    if max_wall_sec<120 or max_wall_sec>7200:
+        raise ValueError('max_wall_sec must be between 120 and 7200')
+    pin=load_remote_seed_pin(pin_path,revision=revision)
+    rev=pin['revision']
+    # Pre-create target depot subfolders locally with full-scope Drive service
+    # so the remote short-lived drive.file token writes only into app-owned folders.
+    file_specs=[]
+    for rel in REQUIRED:
+        sub,name=rel.split('/',1)
+        folder_id=ensure_folder(service,root_id,sub,allow_write=True)
+        file_specs.append({
+            'path':rel,'name':name,'folder_id':folder_id,
+            'size':pin['files'][rel]['size'],'sha256':pin['files'][rel]['sha256'],
+        })
+    mint_fn=mint_file_token_fn or h3_drive_token.mint_file_token
+    token_doc=mint_fn()
+    if not isinstance(token_doc,dict) or not token_doc.get('access_token'):
+        raise RuntimeError('Failed to mint short-lived drive.file token for remote-seed')
+
+    cli_fn=run_cli_fn or _run_remote_seed_cli
+    rec_fn=record_session_fn or record_session
+    confirm_fn=confirm_active_fn or confirm_session_active
+    stop_fn=stop_verify_fn or (lambda s: _stop_and_verify_remote_seed_session(s,colab_auth,run_cli_fn=cli_fn))
+
+    session='muse-seed-'+uuid.uuid4().hex[:10]
+    deadline_utc=(dt.datetime.now(dt.timezone.utc)+dt.timedelta(seconds=max_wall_sec)).isoformat()
+    allocation_attempted=False
+    watchdog_proc=None
+    stop_result={'session':session,'stopped_confirmed':False,'state':'UNKNOWN','record_marked':False}
+    remote_entries=None
+
+    atomic_json(STATE,{'status':'REMOTE_SEEDING','hf_revision':rev,'session':session,'verified_files':[]})
+    with tempfile.TemporaryDirectory(prefix='muse_remote_seed_') as td:
+        work=Path(td)
+        ready_path=work/'watchdog_ready.json'
+        spec_path=work/'seed_spec.json'
+        spec_path.write_text(json.dumps({
+            'repo':HF_REPO,'revision':rev,'downloader':downloader,'files':file_specs,
+        },ensure_ascii=False,indent=2),encoding='utf-8')
+        token_path=h3_drive_token.write_token_file(work/'drive_token.json',token_doc)
+        worker_path=work/'remote_seed_worker.py'
+        worker_path.write_text(build_remote_seed_script(),encoding='utf-8')
+
+        try:
+            rec_fn(session,gpu_type or 'CPU',session,deadline_utc,
+                   production_task_id='remote-seed',status='allocating')
+            new_cmd=['new','-s',session]
+            if gpu_type:
+                new_cmd+=['--gpu',gpu_type]
+            allocation_attempted=True
+            cli_fn(new_cmd,colab_auth,timeout=420,check=True)
+            if confirm_fn(session) is None:
+                raise RuntimeError(f'Pre-registered remote-seed session {session} vanished')
+            if start_watchdog_fn is not None:
+                watchdog_proc=start_watchdog_fn(session,ready_path)
+            else:
+                log_fp=open(work/'watchdog.log','a',encoding='utf-8')
+                try:
+                    watchdog_proc=subprocess.Popen(
+                        [sys.executable,str(ROOT/'h3_session_watchdog.py'),'watch',
+                         '--session',session,'--colab-auth',colab_auth,
+                         '--production-task-id','remote-seed','--ready-file',str(ready_path)],
+                        stdout=log_fp,stderr=subprocess.STDOUT,stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                finally:
+                    log_fp.close()
+                _wait_remote_seed_watchdog(watchdog_proc,ready_path,session)
+
+            cli_fn(['exec','-s',session,'-c',f'import os; os.makedirs({REMOTE_SEED_DIR!r}, exist_ok=True)'],
+                   colab_auth,timeout=120,check=True)
+            for local_f,remote_name in (
+                (spec_path,'seed_spec.json'),
+                (token_path,'drive_token.json'),
+                (worker_path,'remote_seed_worker.py'),
+            ):
+                cli_fn(['upload','-s',session,str(local_f),f'{REMOTE_SEED_DIR}/{remote_name}'],
+                       colab_auth,timeout=120,check=True)
+            exec_res=cli_fn(['exec','-s',session,'-f',str(worker_path),'--timeout',str(max_wall_sec)],
+                            colab_auth,timeout=max_wall_sec+120,check=True)
+            parsed=parse_remote_seed_result(exec_res.get('stdout',''))
+            remote_entries=parsed.get('files')
+            if not isinstance(remote_entries,list) or {e.get('path') for e in remote_entries}!=set(REQUIRED):
+                raise RuntimeError('Remote seed did not return all four required model entries')
+        finally:
+            if allocation_attempted:
+                stop_result=stop_fn(session)
+            if watchdog_proc is not None and stop_result.get('stopped_confirmed'):
+                try:
+                    if watchdog_proc.poll() is None:
+                        watchdog_proc.terminate()
+                except Exception:
+                    pass
+
+    if not stop_result.get('stopped_confirmed'):
+        raise RuntimeError(f'Remote seed session {session} stop not verified; refusing READY publish')
+
+    entries=[]
+    for e in remote_entries:
+        entry={
+            'path':e['path'],'drive_file_id':e['drive_file_id'],'parent_id':e['parent_id'],
+            'size':int(e['size']),'sha256':str(e['sha256']).lower(),
+            'server_md5':e['server_md5'],'server_verified':True,'hf_revision':rev,
+        }
+        verify_drive_entry(service,entry)
+        entries.append(entry)
+
+    manifest={
+        'status':'READY','verification_method':'drive_v3_server_api',
+        'account_verified':True,'verified_at_utc':dt.datetime.now(dt.timezone.utc).isoformat(),
+        'depot_root_id':root_id,'hf_repo':HF_REPO,'hf_revision':rev,'files':entries,
+    }
+    remote_ready=publish_manifest_to_drive(service,root_id,manifest)
+    config=read_json(CFG)
+    config['remote_manifest']=remote_ready
+    atomic_json(CFG,config)
+    atomic_json(READY,manifest)
+    atomic_json(STATE,{'status':'READY','hf_revision':rev,'verified_files':len(entries)})
+    return {
+        'ready':True,'remote_seeded':True,'session':session,'stop_verified':True,
+        'files':len(entries),'bytes':sum(e['size'] for e in entries),
+    }
+
+
 def cli():
-    p=argparse.ArgumentParser(description='Muse independent Drive H3 model depot; ZERO Colab GPU allocations')
-    p.add_argument('action',choices=('account-check','init','smoke','seed','verify'))
+    p=argparse.ArgumentParser(description='Muse independent Drive H3 model depot; remote-seed explicitly allocates a temporary watchdog-protected Colab session')
+    p.add_argument('action',choices=('account-check','init','smoke','seed','remote-seed','verify'))
     p.add_argument('--colab-auth',choices=('oauth2','adc'),default='oauth2')
     p.add_argument('--allow-drive-write',action='store_true')
     p.add_argument('--allow-large-transfer',action='store_true')
+    p.add_argument('--confirm-remote-seed',action='store_true',
+                   help='Explicit confirmation to allocate a temporary Colab session for remote-seed')
     p.add_argument('--hf-revision',default='')
+    p.add_argument('--pin-file',default=str(CONFIG_PIN_FILE),
+                   help='Locked HF files manifest for remote-seed (default: config/pinned_hf_files.json)')
+    p.add_argument('--max-wall-sec',type=int,default=REMOTE_SEED_DEFAULT_WALL_SEC,
+                   help='Watchdog wall-time cap in seconds for remote-seed (120..7200)')
+    p.add_argument('--downloader',choices=('auto','aria2c','range'),default='auto',
+                   help='In-cloud HF download strategy for remote-seed')
+    p.add_argument('--gpu-type',default='',
+                   help='Optional Colab runtime accelerator for remote-seed (default: CPU)')
     p.add_argument('--source',choices=('hub','direct'),default='hub',
                    help='model download strategy: hub (huggingface_hub) or direct (pinned resolve URL + Range resume)')
     a=p.parse_args()
-    if a.action in ('init','smoke','seed') and not a.allow_drive_write:
+    if a.action in ('init','smoke','seed','remote-seed') and not a.allow_drive_write:
         p.error('Mutating Drive requires --allow-drive-write')
-    if a.action=='seed' and not a.allow_large_transfer:
+    if a.action in ('seed','remote-seed') and not a.allow_large_transfer:
         p.error('37GB-class transfer requires --allow-large-transfer')
+    if a.action=='remote-seed' and not a.confirm_remote_seed:
+        p.error('Remote Colab seeding requires --confirm-remote-seed')
     try:
         s=drive_service()
         ok=account_matches(s,a.colab_auth)
@@ -543,6 +1101,12 @@ def cli():
         elif a.action=='seed':
             config=read_json(CFG)
             result=seed(s,config['drive_root_folder_id'],a.hf_revision,source=a.source)
+        elif a.action=='remote-seed':
+            config=read_json(CFG)
+            result=remote_seed(s,config['drive_root_folder_id'],pin_path=Path(a.pin_file),
+                               revision=a.hf_revision,colab_auth=a.colab_auth,
+                               max_wall_sec=a.max_wall_sec,downloader=a.downloader,
+                               gpu_type=a.gpu_type)
         else:result=verify_ready(s,ok)
         print(json.dumps(result,ensure_ascii=False,indent=2))
     except Exception as e:

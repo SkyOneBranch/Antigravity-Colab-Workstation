@@ -1,5 +1,5 @@
 {
-  "generated_utc": "2026-11-15",
+  "generated_utc": "2026-11-19",
   "source": "~/workspace/Muse_Colab_H3_Drive_v3/ (production baseline; verbatim copies SHA-256-verified at migration)",
   "note": "Every file in this repo except SOURCE_MANIFEST.json itself. Regenerate after any change; verify with scripts/verify_manifest.py. Excluded by policy and therefore absent: model weights, poster binary, MP4s, live ledgers/sessions/depot state, .venv, __pycache__.",
   "files": [
@@ -53,20 +53,20 @@
     },
     {
       "path": "AGENTS.md",
-      "size_bytes": 4622,
-      "sha256": "ae549977cf69a5084c24b42ea273eacdfd413de023c42b15a4fa4c0489b47238",
+      "size_bytes": 5843,
+      "sha256": "e946b8ad9f94a6b0bc39df492a644ee5da73055e6c9407ccf0aec58ee604788f",
       "role": "Supporting file"
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 6269,
-      "sha256": "e777e80c1b3241600cbf70e6612e470d61b9b23d95306b1b460d44a8533ef7a8",
+      "size_bytes": 11492,
+      "sha256": "38c08d74cdc10d356f46d9941452f9a0e491ae461b3b1b167ee065e5fbaaaf28",
       "role": "Supporting file"
     },
     {
       "path": "README.md",
-      "size_bytes": 6999,
-      "sha256": "8353e0c15c39ec9a690567f27c623f683d40edb3e944bbf8d621f7e9b827ae9b",
+      "size_bytes": 10209,
+      "sha256": "638382dc4c4901396bdb5cbe7db153f30a2c9f7e6f71caa4f856eb7dbf2327bc",
       "role": "Supporting file"
     },
     {
@@ -587,8 +587,8 @@
     },
     {
       "path": "drive_depot.py",
-      "size_bytes": 29852,
-      "sha256": "02b0eb1598445e326e878d2c07ae259a27a6e10de7fba01426e96a4026d36200",
+      "size_bytes": 55503,
+      "sha256": "88b1d9b74925827128d2d6e61410ca1edb05219400b83ef5a8613e31b9280bff",
       "role": "Model depot init / seed / verify via Drive API (READY manifest)"
     },
     {
@@ -623,8 +623,8 @@
     },
     {
       "path": "h3_comfyui_cache.py",
-      "size_bytes": 12381,
-      "sha256": "aaea4e824b1c882879d05104b3e079eb2afc71a5275f8fb91810fa21f5334356",
+      "size_bytes": 42706,
+      "sha256": "639e3e21c4d155a4d660a41464957bd2af9955139c96120d04a66baab39dd71a",
       "role": "ComfyUI source archive build / verify / publish to Drive cache"
     },
     {
@@ -635,14 +635,14 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 199511,
-      "sha256": "b87f5616dfda94cb3dd4c9e0ddf374f8679bda952890662af37a8748c034d248",
+      "size_bytes": 206317,
+      "sha256": "f68b8eac3d5893d9f9418ed5002c052c4e56facd56086edefdcd7ff9b3055bee",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
       "path": "h3_drive_download.py",
-      "size_bytes": 42020,
-      "sha256": "1715337c5e9d6a674b3d3be036475a02e614c67b74baab6982b12ffccb8efcfd",
+      "size_bytes": 64364,
+      "sha256": "9b6f33eb26deb3420945996c9248f5c40402cb7e933a5b32e6cca5955b658530",
       "role": "Supporting file"
     },
     {
@@ -743,8 +743,8 @@
     },
     {
       "path": "h3_remote_worker.py",
-      "size_bytes": 65469,
-      "sha256": "5ddd6ce05dce681fe750d337bf30672a377557bfc8090d0b6308272d7fe7903f",
+      "size_bytes": 92414,
+      "sha256": "4bfb7cc68c1e472605d2ea72b12e81d5f703a2b99deb9fadda92506180e2038c",
       "role": "Remote ComfyUI worker: restore, inference, find_rendered_video, assemble"
     },
     {
@@ -755,8 +755,8 @@
     },
     {
       "path": "h3_run_manifest.py",
-      "size_bytes": 21402,
-      "sha256": "404549d28f89b3ccce496eb0a8800134508fcb24b28b3d73ead7ff602f5f4f79",
+      "size_bytes": 22343,
+      "sha256": "cb7f9f357df83c579436e1c0a1cdb4b342d0a6930fe5a9f15c327dc617182d06",
       "role": "Supporting file"
     },
     {
@@ -947,8 +947,8 @@
     },
     {
       "path": "scripts/reliability_report.py",
-      "size_bytes": 1662,
-      "sha256": "5bd1084766425a4e3869cb7d409aee098d5de81f54f409b542b64d01896bcce5",
+      "size_bytes": 6021,
+      "sha256": "548f8a98e349ace2c7e455dd37562742fa2dd00b2dbed1640b7a7486db1daabb",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -977,8 +977,8 @@
     },
     {
       "path": "scripts/setup_isolated_account.py",
-      "size_bytes": 28541,
-      "sha256": "74328ae7b28bd8e77a107ca0e57d6ae6c3ba56267cf4affd138dbb55f168ae87",
+      "size_bytes": 32053,
+      "sha256": "32b802c85ecee649eed2940579ae364eb33e36b4ce1982d3d3986e6494ed550d",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -1042,6 +1042,12 @@
       "role": "Tests: CLI lookup, ADC metadata, Drive mount gates, READY guards"
     },
     {
+      "path": "tests/test_comfyui_wheelhouse.py",
+      "size_bytes": 26648,
+      "sha256": "2fe12e9ed3decf7c0d0b532971132744a2cb416fad81cb9097090049f043c601",
+      "role": "Tests"
+    },
+    {
       "path": "tests/test_config_contract.py",
       "size_bytes": 3257,
       "sha256": "c9f0741a3147d7bfd04a7a7b052856859e81cf86ab71a3ebe3d6bf042ad0e8d5",
@@ -1052,6 +1058,12 @@
       "size_bytes": 3995,
       "sha256": "76710817aa23fe5c2f5634334ca80bf4515e8bb823e49ba6a82928a58884bf53",
       "role": "Tests: video contract, prompts, workflow patch, poster hash (asset-gated)"
+    },
+    {
+      "path": "tests/test_controller_wheelhouse_telemetry.py",
+      "size_bytes": 10159,
+      "sha256": "74cf40bf019dd6107ac9a74b7c5e7b9ef9f63d1c41656dbd67144b4b5fa23c1a",
+      "role": "Tests"
     },
     {
       "path": "tests/test_deliver.py",
@@ -1078,9 +1090,21 @@
       "role": "Tests: depot verify / manifest guards (mocked)"
     },
     {
+      "path": "tests/test_drive_depot_remote_seed.py",
+      "size_bytes": 12484,
+      "sha256": "67a9f32ec3fc4faf2d746141ba58583927e3b03ecfbc70dc921795f0e8852cee",
+      "role": "Tests"
+    },
+    {
       "path": "tests/test_drive_download.py",
-      "size_bytes": 47174,
-      "sha256": "2e1a2bb660807f3b5a0c0f748d437ea8dbc6f54ffb54778546905cc23c3368fe",
+      "size_bytes": 47392,
+      "sha256": "c03e000bebcedc6d165a0ed45059bfd610bf69ba1929d56d610dd0ae80b411b7",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_drive_download_v2.py",
+      "size_bytes": 20617,
+      "sha256": "ea9a911940448e45e17550a7bd4cf4d2b31eafc3d78b977603b2a213dcaa9e6e",
       "role": "Tests"
     },
     {
@@ -1162,9 +1186,21 @@
       "role": "Tests"
     },
     {
+      "path": "tests/test_reliability_coldstart.py",
+      "size_bytes": 5060,
+      "sha256": "d896348365f35d7e27d582cba957c71afe5d971d6ec76ff1277286c00196a755",
+      "role": "Tests"
+    },
+    {
       "path": "tests/test_reliability_metrics.py",
       "size_bytes": 9961,
       "sha256": "01d67e9657dc0862fbafeee22ccc2c575cdd5c0a43c38c2ddae1cf184d4b0d3f",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_remote_worker_v020.py",
+      "size_bytes": 28424,
+      "sha256": "a025c8b7e522bf8287cd8541c28bf5a3dbd267aa95b77e75de3ed7a55b9da9e9",
       "role": "Tests"
     },
     {

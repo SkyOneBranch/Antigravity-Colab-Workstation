@@ -8,8 +8,14 @@ This repository is a standalone, fail-closed **Google Colab GPU workstation** dr
 - `.agents/` houses the Antigravity skill and tool guard:
   - `.agents/skills/colab-h3-video/SKILL.md` — mandatory preflight -> confirm -> caffeinate live run -> QA -> verify_shutdown -> budget workflow.
   - `.agents/hooks.json` & `.agents/pre_tool_guard.py` — blocks `.secrets/`, `.gcloud-colab/`, `~/.config/colab-cli/`, `~/.config/gcloud/`, and unguarded `colab` CLI calls while permitting audited wrapper commands.
-- `scripts/` provides shell entrypoints (`install_colab_cli.sh`, `setup_isolated_account.py`, `preflight.sh`, `run_h3_task.sh`, `check_outputs.sh`, `verify_shutdown.sh`, `check_budget.sh`, `install_macos_guardian.sh`, CI validators).
+- `scripts/` provides shell entrypoints (`install_colab_cli.sh`, `setup_isolated_account.py`, `preflight.sh`, `run_h3_task.sh`, `check_outputs.sh`, `verify_shutdown.sh`, `check_budget.sh`, `install_macos_guardian.sh`, `reliability_report.py`, CI validators).
 - `config/` contains pinned YAML policy contracts (`budget_policy.yaml`, `gpu_policy.yaml`, `video_profiles.yaml`), manifest examples, and task specs (`config/tasks/`).
+- **v0.2.0 Fast Cold-Start Controls**:
+  - `h3_drive_download.py`: zero-copy `os.pwrite` + streaming SHA-256 (`H3_DRIVE_CONCURRENT_WORKERS` in `1..16`, default `12`; `H3_DRIVE_MAX_GLOBAL_CONNECTIONS`, default `16`).
+  - `h3_comfyui_cache.py`: `build-wheelhouse` / `publish-wheelhouse` (requires `--allow-drive-write`) and pure-stdlib wheelhouse helpers; synced across accounts via `scripts/setup_isolated_account.py --sync-shared-caches`.
+  - `h3_remote_worker.py`: dual-track `ensure_comfy` || `restore_weights` into `/content/nvme_models/h3` (`H3_NVME_MODELS_DIR`) with atomic symlinks, offline wheelhouse (`WHEELHOUSE_FALLBACK_PYPI` on fallback), auto `--highvram --disable-mmap` for VRAM `>= 76800` MiB (`H3_COMFY_VRAM_FLAGS`), and `COLDSTART_METRICS_JSON` telemetry.
+  - `drive_depot.py remote-seed`: in-cloud HF-to-Drive seeding gated by `--allow-drive-write --allow-large-transfer --confirm-remote-seed` with short-lived `drive.file` token, watchdog protection, and unconditional `finally` shutdown verification.
+  - `scripts/reliability_report.py`: reports cold-start P50/P90 and `wheelhouse_hit_rate` from persisted `COLDSTART_METRICS_JSON` in `model_cache/run_manifests/<run_id>.json`.
 
 ## 2. Three-Layer Account & Secret Isolation
 

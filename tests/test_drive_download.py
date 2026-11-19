@@ -352,12 +352,15 @@ class FullDownloadTests(DownloadTestBase):
 
 
 class DownloadConstantsTest(unittest.TestCase):
-    """TASK-007: concurrent-download tuning constants."""
+    """TASK-007 / v0.2.0 F1: concurrent-download tuning constants."""
 
     def test_defaults(self):
         self.assertEqual(dd.DEFAULT_CHUNK_SIZE, 8 * 1024 * 1024)
         self.assertEqual(dd.CONCURRENT_MIN_SIZE, 256 * 1024 * 1024)
-        self.assertEqual(dd.DEFAULT_CONCURRENT_WORKERS, 4)
+        self.assertEqual(dd.DEFAULT_CONCURRENT_WORKERS, 12)
+        self.assertEqual(dd.MIN_CONCURRENT_WORKERS, 1)
+        self.assertEqual(dd.MAX_CONCURRENT_WORKERS, 16)
+        self.assertEqual(dd.DEFAULT_MAX_GLOBAL_CONNECTIONS, 16)
 
 
 class ConcurrentDownloadTest(DownloadTestBase):
@@ -406,43 +409,46 @@ class ConcurrentDownloadTest(DownloadTestBase):
         self.assertEqual(seen[-1], len(self.BIG_CONTENT))
         self.assertEqual(seen, sorted(seen))
 
-    def test_concurrent_merge_releases_shards_one_by_one(self):
-        """TASK-007.1: the merge moves shard 0 into place (zero-copy
-        os.replace) and unlinks each later shard right after appending
-        it — no second full copy, so the extra disk peak is one shard,
-        not the whole file. Final bytes + SHA-256 must be identical,
-        and no shard file may survive."""
+    def test_concurrent_zero_copy_pwrite_no_shards(self):
+        """v0.2.0 F1: concurrent download preallocates a single .part via
+        os.truncate and writes directly via lock-free os.pwrite — zero
+        .shard* temp files, zero merge phase, peak disk <= 1.0x. Final
+        bytes + SHA-256 must be identical, and neither .part nor its
+        bitmap sidecar may survive."""
         dest = self._dest("big.bin")
         part = Path(str(dest) + ".part")
-        shard_paths = [Path(str(part) + f".shard{i}") for i in range(4)]
+        bpath = Path(str(part) + ".bitmap.json")
+        truncates = []
+        pwrites = []
         replaces = []
-        unlinks = []
+        real_truncate = os.truncate
+        real_pwrite = os.pwrite
         real_replace = os.replace
-        real_unlink = Path.unlink
+
+        def _recording_truncate(path_or_fd, length):
+            truncates.append(length)
+            return real_truncate(path_or_fd, length)
+
+        def _recording_pwrite(fd, data, offset):
+            pwrites.append((offset, len(data)))
+            return real_pwrite(fd, data, offset)
 
         def _recording_replace(src, dst, *a, **k):
             replaces.append((str(src), str(dst)))
             return real_replace(src, dst, *a, **k)
 
-        def _recording_unlink(self, missing_ok=False):
-            if ".shard" in str(self):
-                unlinks.append(str(self))
-            return real_unlink(self, missing_ok=missing_ok)
-
-        with patch.object(os, "replace", _recording_replace), \
-                patch.object(Path, "unlink", _recording_unlink):
+        with patch.object(os, "truncate", _recording_truncate), \
+                patch.object(os, "pwrite", _recording_pwrite), \
+                patch.object(os, "replace", _recording_replace):
             out = self._download_big()
         self.assertEqual(Path(out["path"]).read_bytes(), self.BIG_CONTENT)
         self.assertEqual(out["sha256"], sha(self.BIG_CONTENT))
         self.assertFalse(part.exists())
-        for p in shard_paths:
-            self.assertFalse(p.exists())
-        # Zero-copy first shard: shard0 was moved into .part, not copied.
-        self.assertIn((str(shard_paths[0]), str(part)), replaces)
-        # Shards 1..3 unlinked by the merge itself (3 calls), then the
-        # finally re-tries all four (4 more): the merge released them
-        # one by one instead of relying on the finally.
-        self.assertGreaterEqual(len(unlinks), 7)
+        self.assertFalse(bpath.exists())
+        self.assertEqual(list(Path(self.td).glob("*.shard*")), [])
+        self.assertIn(len(self.BIG_CONTENT), truncates)
+        self.assertEqual(sum(n for _, n in pwrites), len(self.BIG_CONTENT))
+        self.assertIn((str(part), str(dest)), replaces)
 
     def test_concurrent_range_ignored_falls_back(self):
         self.drive.media_plan[self.BIG_ID] = [

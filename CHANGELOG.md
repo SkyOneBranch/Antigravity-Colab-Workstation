@@ -1,5 +1,89 @@
 # CHANGELOG
 
+## v0.2.0 — 2026-11-19 — Fast Cold-Start Engine (F1–F5)
+
+End-to-end cold-start acceleration across the Drive downloader, ComfyUI
+dependency cache, remote worker setup pipeline, in-cloud depot seeder, and
+cold-start telemetry reporting. All existing `TaskSpec`, budget (`30.0 CU`
+task / `25.0 CU` session), and three-layer account-isolation invariants remain
+unchanged and 100% backwards-compatible.
+
+### Added / Changed
+
+- **F1 Zero-Copy High-Concurrency Drive Download (`h3_drive_download.py`)**:
+  - Replaced `.part.shard0..N` temp files and single-threaded merge with a
+    preallocated single `.part` file (`os.truncate` + lock-free multi-threaded
+    `os.pwrite`, peak disk `<= 1.0x`).
+  - Raised `DEFAULT_CONCURRENT_WORKERS` from `4` to `12` (configurable via
+    `H3_DRIVE_CONCURRENT_WORKERS` in `1..16`) and added a process-wide Drive
+    connection semaphore (`DEFAULT_MAX_GLOBAL_CONNECTIONS = 16`, configurable
+    via `H3_DRIVE_MAX_GLOBAL_CONNECTIONS`).
+  - Added ordered in-flight streaming SHA-256 (`_StreamingBlockHasher`) with
+    bounded memory buffering and selective `os.pread` spillback/resume, atomic
+    `.part.bitmap.json` block-level resume, `abort_event` /
+    `DriveDownloadAbortedError` cancellation, and single-flight
+    `FileTokenProvider.refresh(failed_token_id=None)`.
+- **F2 Offline ComfyUI Wheelhouse Cache (`h3_comfyui_cache.py`, `scripts/setup_isolated_account.py`, `h3_controller.py`)**:
+  - Made Drive SDK imports lazy in `h3_comfyui_cache.py` so pure-stdlib
+    wheelhouse helpers (`normalize_pkg_name`, `normalize_python_tag`,
+    `filter_requirements_lines`, `filter_requirements_file`,
+    `validate_wheelhouse_entry`, `select_wheelhouse_entry`,
+    `build_wheelhouse_task_descriptor`, `verify_local_wheelhouse`) work without
+    Drive dependencies.
+  - Added `build-wheelhouse` and `publish-wheelhouse` (gated by
+    `--allow-drive-write`) packaging deterministic
+    `comfyui-wheelhouse-<commit>-<pytag>.tar.gz` (`wheelhouse/*.whl` +
+    `wheelhouse/WHEELHOUSE_META.json`) for Colab Linux x86_64 (`py311`/`py312`)
+    while excluding preinstalled `torch`, `torchvision`, `torchaudio`,
+    `triton`, and `nvidia-*` packages.
+  - Updated `scripts/setup_isolated_account.py` (`--sync-shared-caches`) to
+    discover and verify commit-matching wheelhouse bundles in
+    `Muse-H3-ComfyUI-Source` alongside the source tarball, and wired optional
+    `drive_download["wheelhouses"]` through `h3_controller.py`.
+- **F3 Dual-Track Parallel Setup (`h3_remote_worker.py`)**:
+  - Runs `ensure_comfy()` and `restore_weights()` concurrently via
+    `ThreadPoolExecutor(max_workers=2)` with a shared `abort_event`,
+    thread-safe token refresh, thread-local command failure tracking, and
+    accurate failing-stage attribution in `WORKER_FAILED_JSON`.
+  - Prefers offline wheelhouse install (`pip install --no-index --find-links`)
+    and emits structured `WHEELHOUSE_FALLBACK_PYPI` when falling back to PyPI.
+- **F4 Independent NVMe Model Store & High-VRAM Flags (`h3_remote_worker.py`)**:
+  - Stores downloaded weights under `/content/nvme_models/h3` (overridable via
+    `H3_NVME_MODELS_DIR`) and atomically symlinks verified weights into
+    `/content/ComfyUI/models/` via `link_models_into_comfy()` with
+    `require_inside` and readability checks.
+  - Auto-detects GPU VRAM (`detect_gpu_vram_mib`) and appends
+    `--highvram --disable-mmap` for VRAM `>= 76800` MiB (overridable via
+    `H3_COMFY_VRAM_FLAGS`).
+- **F5 In-Cloud Remote Seeding & Cold-Start Telemetry (`drive_depot.py`, `h3_controller.py`, `h3_run_manifest.py`, `scripts/reliability_report.py`)**:
+  - Added `drive_depot.py remote-seed` gated by `--allow-drive-write`,
+    `--allow-large-transfer`, and `--confirm-remote-seed`: launches a
+    watchdog-protected temporary Colab session with a short-lived `drive.file`
+    token, downloads locked `config/pinned_hf_files.json` weights concurrently
+    in-cloud (`aria2c` or multi-threaded Range), verifies SHA-256 remotely,
+    uploads to Drive Depot, and enforces `colab stop` + tristate `STOPPED`
+    verification in `finally`.
+  - Worker emits `COLDSTART_METRICS_JSON` (also persisted in
+    `MUSE_H3_JOB_STATE.json`); `h3_controller.py` persists it into
+    `model_cache/run_manifests/<run_id>.json` via `h3_run_manifest.py`, and
+    `scripts/reliability_report.py` aggregates cold-start P50/P90 latencies and
+    `wheelhouse_hit_rate`.
+
+### New Offline Unit Test Suites (0 CU)
+
+- `tests/test_drive_download_v2.py` (F1 zero-copy `pwrite`, streaming SHA-256,
+  bitmap resume, global cap, `abort_event`, single-flight token refresh)
+- `tests/test_comfyui_wheelhouse.py` (F2 wheelhouse build/verify/publish,
+  requirements filtering, cross-account sync, lazy Drive imports)
+- `tests/test_remote_worker_v2.py` (F1–F5 worker dual-track, wheelhouse
+  offline/fallback, NVMe symlinks, VRAM flags, `COLDSTART_METRICS_JSON`)
+- `tests/test_controller_wheelhouse_telemetry.py` (F2/F5 controller wiring,
+  log parsing, run manifest persistence)
+- `tests/test_drive_depot_remote_seed.py` (F5 triple-flag gate, watchdog &
+  `finally` shutdown guarantees, remote Range/SHA-256 helpers)
+- `tests/test_reliability_coldstart.py` (F5 P50/P90 & `wheelhouse_hit_rate`
+  aggregation)
+
 ## v0.1.0 — 2026-11-12 — initial migration (TASK-001, local repo)
 
 Initial private migration of the verified Muse Colab H3 production

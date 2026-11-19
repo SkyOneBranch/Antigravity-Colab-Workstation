@@ -144,6 +144,67 @@ def _comfyui_download_task():
     }
 
 
+def _comfyui_wheelhouse_task(manifest_path=None, commit: str | None = None) -> dict | None:
+    """Optional ComfyUI offline wheelhouse descriptor map (v0.2.0 F2).
+
+    Reads `wheelhouses` from `model_cache/comfyui_source_manifest.json`
+    and returns `{pytag: {file_id, size, sha256, archive, commit,
+    python_tag, excluded_packages, excluded_prefixes, server_md5}}` for
+    entries matching `commit` (or all valid entries when `commit` is
+    None). Returns None gracefully when the manifest is missing or has
+    no valid wheelhouse entries — the worker then falls back to online
+    pip install without breaking anything.
+    """
+    path = Path(manifest_path) if manifest_path is not None else (
+        ROOT / "model_cache" / "comfyui_source_manifest.json"
+    )
+    if not path.exists():
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    try:
+        import h3_comfyui_cache
+        builder = getattr(h3_comfyui_cache, "build_wheelhouse_task_descriptor", None)
+        if callable(builder):
+            return builder(manifest, commit=commit)
+    except Exception:
+        pass
+    wheelhouses = manifest.get("wheelhouses")
+    if not isinstance(wheelhouses, dict) or not wheelhouses:
+        return None
+    result = {}
+    for pytag, entry in sorted(wheelhouses.items()):
+        if not isinstance(entry, dict):
+            continue
+        entry_commit = entry.get("commit") or manifest.get("commit") or ""
+        if commit and entry_commit and entry_commit != commit:
+            continue
+        file_id = entry.get("file_id") or entry.get("id")
+        sha256 = entry.get("sha256")
+        archive = entry.get("archive_name") or entry.get("filename") or entry.get("archive")
+        size = entry.get("size_bytes") if entry.get("size_bytes") is not None else entry.get("size")
+        if not file_id or not sha256 or not archive or not size:
+            continue
+        result[str(pytag)] = {
+            "file_id": str(file_id),
+            "size": int(size),
+            "sha256": str(sha256).lower(),
+            "archive": str(archive),
+            "commit": str(entry_commit),
+            "python_tag": str(entry.get("python_tag") or pytag),
+            "excluded_packages": list(entry.get("excluded_packages") or [
+                "torch", "torchvision", "torchaudio", "triton",
+            ]),
+            "excluded_prefixes": list(entry.get("excluded_prefixes") or ["nvidia-"]),
+            "server_md5": entry.get("server_md5"),
+        }
+    return result or None
+
+
 # ---------------------------------------------------------------------------
 # TASK-007: the generic task engine. One TaskSpec drives a run; --variant
 # A|B is only the built-in fixture adapter. These helpers resolve the
@@ -284,9 +345,10 @@ def _check_task_spec_refs(spec: TaskSpec, drive=None) -> str:
     return "; ".join(parts)
 
 
-def _build_drive_download_block(cache_manifest):
+def _build_drive_download_block(cache_manifest, comfy_ref: str | None = None):
     """Build the drive_download task block from the server-verified
-    model manifest (+ the ComfyUI download entry when present).
+    model manifest (+ the ComfyUI download entry and optional
+    wheelhouse descriptors when present).
     The block carries Drive file ids, pinned sizes and SHA-256s only —
     never a token value. Raises when the manifest does not name
     exactly the four pinned model files."""
@@ -304,13 +366,17 @@ def _build_drive_download_block(cache_manifest):
                       "size": int(x["size"]), "sha256": x["sha256"],
                       "md5": x.get("server_md5")})
     probe_file = min(files, key=lambda f: f["size"])
-    return {
+    block = {
         "files": files,
         "comfyui": _comfyui_download_task(),
         "dest_dir": REMOTE + "/drive_downloads",
         "token_file": REMOTE + "/drive_token.json",
         "probe": {"file_id": probe_file["file_id"]},
     }
+    wheelhouses = _comfyui_wheelhouse_task(commit=comfy_ref)
+    if wheelhouses:
+        block["wheelhouses"] = wheelhouses
+    return block
 
 
 def verify_drive_download_preflight(args) -> dict:
@@ -583,6 +649,74 @@ def download_remote_comfyui_log(session: str, run_dir: Path) -> str | None:
         return None
 
 
+COLDSTART_METRICS_MARKER = "COLDSTART_METRICS_JSON:"
+
+
+def parse_coldstart_metrics(text: str) -> dict | None:
+    """Parse the last valid COLDSTART_METRICS_JSON:<json> line from remote
+    worker log text. Returns the parsed dict or None when absent/malformed.
+    """
+    if not text:
+        return None
+    parsed = None
+    for line in str(text).splitlines():
+        idx = line.find(COLDSTART_METRICS_MARKER)
+        if idx < 0:
+            continue
+        raw = line[idx + len(COLDSTART_METRICS_MARKER):].strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            parsed = obj
+    return parsed
+
+
+def download_remote_worker_log(session: str, run_dir: Path) -> Path | None:
+    """Best-effort download of the remote detached worker log before
+    session stop (v0.2.0 F5). Returns the local Path if non-empty, else
+    None. Never raises."""
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    local = run_dir / "worker_remote.log"
+    try:
+        run_cli(["download", "-s", session, REMOTE + "/worker.log", str(local)], timeout=120)
+        return local if local.is_file() and local.stat().st_size > 0 else None
+    except Exception:
+        return None
+
+
+def _record_coldstart_metrics(run_id: str, worker_state: dict | None = None,
+                              worker_log_path: Path | None = None) -> dict | None:
+    """Extract coldstart telemetry from worker job state or downloaded
+    worker.log and persist it into the durable run manifest (v0.2.0 F5).
+    Best-effort: never raises."""
+    try:
+        metrics = None
+        if isinstance(worker_state, dict) and isinstance(worker_state.get("coldstart_metrics"), dict):
+            metrics = worker_state["coldstart_metrics"]
+        if metrics is None and worker_log_path is not None:
+            log_path = Path(worker_log_path)
+            if log_path.is_file():
+                metrics = parse_coldstart_metrics(log_path.read_text(encoding="utf-8", errors="replace"))
+        if not isinstance(metrics, dict) or not metrics:
+            return None
+        _manifest_update(run_id, coldstart_metrics=metrics)
+        record({
+            "event": "coldstart_metrics_recorded",
+            "run_id": run_id,
+            "total_coldstart_sec": metrics.get("total_coldstart_sec"),
+            "wheelhouse_used": metrics.get("wheelhouse_used"),
+            "effective_download_mbps": metrics.get("effective_download_mbps"),
+        })
+        return metrics
+    except Exception:
+        return None
+
+
 def check_worker_done_marker(exec_result: dict, variant: str) -> dict:
     """Fail-closed check that the remote worker finished the variant: it
     only prints MUSE_H3_DONE_JSON after assemble_video wrote the final
@@ -828,6 +962,18 @@ def preflight(args) -> dict:
                 + "... commit=" + cache["commit"][:12])
 
     check("comfyui_source_cache", _comfyui_cache)
+
+    def _comfyui_wheelhouse():
+        # Informational only, never a gate: a missing wheelhouse means
+        # the worker falls back to online pip install.
+        wh = _comfyui_wheelhouse_task(commit=getattr(args, "comfy_ref", None))
+        if not wh:
+            return "not built; worker falls back to online pip"
+        parts = [f"{tag}={e['archive']} sha256={e['sha256'][:12]}..."
+                 for tag, e in sorted(wh.items())]
+        return "ready: " + ", ".join(parts)
+
+    check("comfyui_wheelhouse_cache", _comfyui_wheelhouse)
     check("adc_valid", lambda: audit_user_adc_file())
     if _COLAB_AUTH == "oauth2":
         check("colab_oauth_token_valid", lambda: audit_colab_oauth_token_file())
@@ -1675,6 +1821,10 @@ def _manifest_worker_state(run_id: str, state: dict) -> None:
     # records it immediately, so a controller restart after VIDEO_READY
     # still finds the Drive id in the manifest.
     _record_remote_upload(run_id, state)
+    # v0.2.0 F5: persist coldstart telemetry as soon as the worker reports
+    # it in durable job state.
+    if isinstance((state or {}).get("coldstart_metrics"), dict):
+        _record_coldstart_metrics(run_id, state)
 
 
 def _handle_token_refresh_request(session: str, run_id: str, run_dir,
@@ -2063,6 +2213,8 @@ def _resume_finish(args, manifest: dict, worker_state: dict) -> dict:
     # The tail below re-verifies the recorded id server-side before
     # marking DRIVE_VERIFIED.
     _record_remote_upload(run_id, worker_state)
+    worker_log = download_remote_worker_log(session_id, RUNS / run_id)
+    _record_coldstart_metrics(run_id, worker_state, worker_log)
     live = _inspect_live(run_id)
     production_result = {
         "variant": variant, "run_id": run_id, "session": session_id,
@@ -2543,7 +2695,7 @@ def _run_bootstrap(args, session: str, run_dir: Path, budget_sec: int,
         # a 1 MiB Range probe before the worker starts. The worker
         # token file is deleted by the worker on first read.
         _begin("drive_download_probe")
-        drive_download = _build_drive_download_block(args.cache_manifest)
+        drive_download = _build_drive_download_block(args.cache_manifest, comfy_ref=args.comfy_ref)
         _mint_and_upload_drive_token(session, run_dir, "drive_token.json")
         _mint_and_upload_drive_token(session, run_dir, "drive_token_probe.json")
         probe_spec_path = run_dir / "drive_download_probe.json"
@@ -3422,10 +3574,15 @@ def _run_variant_inner(args) -> dict:
                         args.run_id, session, run_dir, renewal_state))
                 done_info = check_job_done_info(worker_state.get("output"), variant, spec)
             except Exception:
-                # Pull the server log before the session stops: it holds
-                # the /prompt rejection detail the worker output may lack.
+                # Pull the server log and worker log before the session stops:
+                # comfyui.log holds /prompt rejection detail; worker.log may
+                # hold COLDSTART_METRICS_JSON if coldstart finished before failure.
                 download_remote_comfyui_log(session, run_dir)
+                worker_log = download_remote_worker_log(session, run_dir)
+                _record_coldstart_metrics(args.run_id, None, worker_log)
                 raise
+            worker_log = download_remote_worker_log(session, run_dir)
+            _record_coldstart_metrics(args.run_id, worker_state, worker_log)
             record({"event": "worker_done", "variant": variant, "session": session, "done": done_info})
             _manifest_update(args.run_id, task_state="INFERENCE_COMPLETED",
                              last_verified_stage="INFERENCE_COMPLETED",
