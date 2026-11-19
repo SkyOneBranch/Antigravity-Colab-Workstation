@@ -47,6 +47,10 @@ def sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def md5_hex(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest().lower()
+
+
 def md5_b64(b: bytes) -> str:
     return base64.b64encode(hashlib.md5(b).digest()).decode("ascii")
 
@@ -106,7 +110,7 @@ class FakeUploadDrive:
         self._next_id += 1
         self.files[fid] = {
             "id": fid, "name": session["name"], "size": len(content),
-            "md5Checksum": md5_b64(content), "sha256Checksum": sha(content),
+            "md5Checksum": md5_hex(content), "sha256Checksum": sha(content),
             "parents": [session["folder_id"]],
             "appProperties": {"run_id": session["run_id"],
                               "variant": session["variant"]},
@@ -580,13 +584,61 @@ class WorkerUploadTests(unittest.TestCase):
         evidence = self.hw.upload_remote_archive(
             self.mp4, self.info, self.task, RUN_ID, "A")
         self.assertEqual(evidence["sha256"], sha(self.CONTENT))
-        self.assertEqual(evidence["md5"], md5_b64(self.CONTENT))
+        self.assertEqual(evidence["md5"], md5_hex(self.CONTENT))
+        self.assertEqual(len(evidence["md5"]), 32)
         self.assertEqual(evidence["uploaded_by"], "worker")
         self.assertEqual(evidence["verified_by"], "worker_readback")
         self.assertEqual(evidence["read_back_bytes"], len(self.CONTENT))
         self.assertFalse(evidence["reused"])
         self.assertEqual(evidence["drive_output_folder_id"], FOLDER)
         self.assertNotIn(SECRET_A, json.dumps(evidence))
+
+    def test_verify_uploaded_normalizes_hex_and_base64_against_drive_hex(self):
+        evidence = self.hw.upload_remote_archive(
+            self.mp4, self.info, self.task, RUN_ID, "A")
+        fid = evidence["drive_file_id"]
+        provider = FileTokenProvider(self.root / "tok_verify.json")
+        dt.write_token_file(
+            self.root / "tok_verify.json",
+            {"access_token": SECRET_A,
+             "expires_at_utc": "2030-01-01T10:00:00Z",
+             "token_id": token_id_for(SECRET_A)})
+        provider.load_initial()
+        uploader = DriveUploader(provider)
+        # 32-char lowercase hex, uppercase hex, and 24-char Base64 all match Drive's 32-char hex md5Checksum.
+        for candidate in (md5_hex(self.CONTENT), md5_hex(self.CONTENT).upper(), md5_b64(self.CONTENT)):
+            res = uploader.verify_uploaded(
+                fid, len(self.CONTENT), sha(self.CONTENT),
+                expected_md5=candidate, parent_id=FOLDER)
+            self.assertTrue(res["verified"])
+        # Wrong hex or wrong Base64 fails closed.
+        for bad in (md5_hex(b"tampered"), md5_b64(b"tampered")):
+            with self.assertRaises(DriveUploadError) as ctx:
+                uploader.verify_uploaded(
+                    fid, len(self.CONTENT), sha(self.CONTENT),
+                    expected_md5=bad, parent_id=FOLDER)
+            self.assertIn("MD5 mismatch", str(ctx.exception))
+        # Missing server md5Checksum also fails closed when expected_md5 is supplied.
+        self.fake.files[fid]["md5Checksum"] = ""
+        with self.assertRaises(DriveUploadError) as ctx:
+            uploader.verify_uploaded(
+                fid, len(self.CONTENT), sha(self.CONTENT),
+                expected_md5=md5_hex(self.CONTENT), parent_id=FOLDER)
+        self.assertIn("MD5 mismatch", str(ctx.exception))
+
+    def test_upload_remote_archive_rejects_tampered_server_md5_hex(self):
+        orig_new_file = self.fake._new_file
+
+        def _tampered_new_file(session, content):
+            fid = orig_new_file(session, content)
+            self.fake.files[fid]["md5Checksum"] = md5_hex(b"tampered-bytes")
+            return fid
+
+        with patch.object(self.fake, "_new_file", side_effect=_tampered_new_file):
+            with self.assertRaises(DriveUploadError) as ctx:
+                self.hw.upload_remote_archive(
+                    self.mp4, self.info, self.task, RUN_ID, "A")
+        self.assertIn("MD5 mismatch", str(ctx.exception))
 
     def test_validation_rejects_wrong_frame_count(self):
         with patch.object(self.hw, "ffprobe", lambda p: {

@@ -16,10 +16,19 @@ from h3_contract import MODEL_FILES,validate_model_cache_manifest,sha256_file,pa
 from h3_job_state import WORKER_PHASE_TO_JOB_STAGE, write_job_state
 from assemble import run as assemble_video,ffprobe
 
-# ---- v0.2.0 Fast Cold-Start constants (F1/F2/F3/F4/F5) ----
+# ---- v0.2.0 / v0.2.1 Fast Cold-Start constants (F1/F2/F3/F4/F5) ----
 DEFAULT_NVME_MODELS_DIR = Path('/content/nvme_models/h3')
-DEFAULT_EXCLUDED_PACKAGES = ("torch", "torchvision", "torchaudio", "triton")
-DEFAULT_EXCLUDED_PREFIXES = ("nvidia-",)
+HEADLESS_EXCLUDED_PACKAGES = ("comfyui-workflow-templates", "comfyui-embedded-docs")
+HEADLESS_EXCLUDED_PREFIXES = ("comfyui-workflow-templates-",)
+DEFAULT_EXCLUDED_PACKAGES = (
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "triton",
+    "comfyui-workflow-templates",
+    "comfyui-embedded-docs",
+)
+DEFAULT_EXCLUDED_PREFIXES = ("nvidia-", "comfyui-workflow-templates-")
 HIGHVRAM_THRESHOLD_MIB = 76800
 HIGHVRAM_DEFAULT_FLAGS = ("--highvram", "--disable-mmap")
 DEFAULT_MODEL_FILE_CONCURRENCY = 2
@@ -322,18 +331,33 @@ def _spec_satisfied(version: str, spec: str) -> bool:
     return True
 
 
-def log_requirements_status(requirements_path):
+def log_requirements_status(
+    requirements_path,
+    excluded_packages=HEADLESS_EXCLUDED_PACKAGES,
+    excluded_prefixes=HEADLESS_EXCLUDED_PREFIXES,
+):
     """Best-effort, no-network diagnostic: which requirements of the pinned
     ComfyUI tree are already satisfied in this runtime. Never blocks the
     install; on any doubt the entry is 'unknown' and pip runs as before.
-    Returns a dict {satisfied, missing, unknown} (lists of requirement lines)."""
+    Headless-optional packages (verified optional in ComfyUI API mode) are
+    recorded under 'excluded' rather than 'missing'.
+    Returns a dict {satisfied, missing, unknown, excluded}."""
     from importlib import metadata as _md
-    satisfied, missing, unknown = [], [], []
+    satisfied, missing, unknown, excluded = [], [], [], []
+    excl_exact = {normalize_pkg_name(p) for p in (excluded_packages or ())}
+    excl_pref = tuple(normalize_pkg_name(p) for p in (excluded_prefixes or ()) if str(p).strip())
     try:
         for line in Path(requirements_path).read_text().splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
+            head = line.split('#', 1)[0].split(';', 1)[0].strip()
+            m_name = re.match(r'^([A-Za-z0-9][A-Za-z0-9_.\-]*)', head)
+            if m_name:
+                norm = normalize_pkg_name(m_name.group(1))
+                if norm in excl_exact or any(norm.startswith(pref) for pref in excl_pref):
+                    excluded.append(line)
+                    continue
             m = re.match(r'^([A-Za-z0-9_.\-]+)\s*(.*)$', line)
             if not m:
                 unknown.append(line)
@@ -350,17 +374,26 @@ def log_requirements_status(requirements_path):
                 missing.append(line + ' (installed ' + installed + ')')
     except Exception as e:
         print('REQUIREMENTS_CHECK_UNAVAILABLE', type(e).__name__, str(e)[:200], flush=True)
-        return {"satisfied": [], "missing": [], "unknown": ["check failed"]}
-    status = {"satisfied": satisfied, "missing": missing, "unknown": unknown}
+        return {"satisfied": [], "missing": [], "unknown": ["check failed"], "excluded": []}
+    status = {"satisfied": satisfied, "missing": missing, "unknown": unknown, "excluded": excluded}
     print('REQUIREMENTS_STATUS', json.dumps(status, ensure_ascii=False), flush=True)
     return status
 
 
-def pip_install_needed(requirements_path):
+def pip_install_needed(
+    requirements_path,
+    excluded_packages=HEADLESS_EXCLUDED_PACKAGES,
+    excluded_prefixes=HEADLESS_EXCLUDED_PREFIXES,
+):
     """True unless the requirements check ran cleanly (no unknowns) and
-    nothing is missing. Skipping pip then is equivalent to running it:
-    pip would install nothing new. Any doubt -> run pip as before."""
-    status = log_requirements_status(requirements_path)
+    nothing is missing (excluding headless-optional packages). Skipping pip
+    then is equivalent to running it: pip would install nothing needed.
+    Any doubt -> run pip as before."""
+    status = log_requirements_status(
+        requirements_path,
+        excluded_packages=excluded_packages,
+        excluded_prefixes=excluded_prefixes,
+    )
     return bool(status["missing"] or status["unknown"])
 
 
@@ -864,8 +897,12 @@ def ensure_comfy(
                     archive_path, entry['sha256'], whl_dest,
                     expected_commit=git_ref, expected_python_tag=pytag)
                 filtered_req = ROOT / 'wheelhouse_requirements.txt'
-                excl_pkgs = entry.get('excluded_packages') or DEFAULT_EXCLUDED_PACKAGES
-                excl_prefs = entry.get('excluded_prefixes') or DEFAULT_EXCLUDED_PREFIXES
+                excl_pkgs = tuple(dict.fromkeys(
+                    list(entry.get('excluded_packages') or DEFAULT_EXCLUDED_PACKAGES)
+                    + list(HEADLESS_EXCLUDED_PACKAGES)))
+                excl_prefs = tuple(dict.fromkeys(
+                    list(entry.get('excluded_prefixes') or DEFAULT_EXCLUDED_PREFIXES)
+                    + list(HEADLESS_EXCLUDED_PREFIXES)))
                 filt = filter_requirements_file(
                     requirements, filtered_req,
                     excluded_packages=excl_pkgs, excluded_prefixes=excl_prefs)
@@ -1599,12 +1636,13 @@ def rescue_rendered_video(comfy, run_id, variant, remaining_budget_seconds, prob
     raise RuntimeError(f'Rescue found no verifiable video for run {run_id} variant {variant} '
                        f'(scanned {len(matches)} name-matching files)')
 
-def _md5_b64(path) -> str:
+def _md5_hex(path) -> str:
+    """Return 32-char lowercase hex MD5 matching Google Drive API v3 md5Checksum."""
     h = hashlib.md5()
     with open(path, "rb") as fp:
         for chunk in iter(lambda: fp.read(4 * 1024 * 1024), b""):
             h.update(chunk)
-    return base64.b64encode(h.digest()).decode("ascii")
+    return h.hexdigest().lower()
 
 
 def validate_assembled_mp4(final, info, spec=None) -> dict:
@@ -1649,7 +1687,7 @@ def validate_assembled_mp4(final, info, spec=None) -> dict:
     sha = sha256_file(final)
     if info.get("sha256") and sha.lower() != str(info["sha256"]).lower():
         raise ValueError("assembled MP4 SHA-256 does not match assemble info")
-    return {"sha256": sha, "md5": _md5_b64(final), "frames": frames}
+    return {"sha256": sha, "md5": _md5_hex(final), "frames": frames}
 
 
 def upload_remote_archive(final, info, task, run_id, version, spec=None):

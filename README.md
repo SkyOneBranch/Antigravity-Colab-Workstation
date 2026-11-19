@@ -34,13 +34,13 @@ Live end-to-end production run on `A100-SXM4-80GB` via `--task-spec config/tasks
 
 ---
 
-## Fast Cold-Start Engine (v0.2.0)
+## Fast Cold-Start Engine (v0.2.0 / v0.2.1)
 
 - **F1 Zero-Copy High-Concurrency Drive Download ([`h3_drive_download.py`](h3_drive_download.py))**:
   - Preallocates a single `.part` file (`os.truncate` + lock-free multi-threaded `os.pwrite`, peak disk `<= 1.0x`, zero `.shard*` temp files or merge pass) with `12` default concurrent workers (`H3_DRIVE_CONCURRENT_WORKERS` in `1..16`) and a process-wide Drive connection cap (`H3_DRIVE_MAX_GLOBAL_CONNECTIONS`, default `16`).
   - Computes ordered in-flight streaming SHA-256 without re-reading completed files from disk, persists `.part.bitmap.json` for block-level resume, supports `abort_event` cancellation (`DriveDownloadAbortedError`), and provides single-flight `FileTokenProvider.refresh` under concurrent 401s.
 - **F2 Offline ComfyUI Wheelhouse Cache ([`h3_comfyui_cache.py`](h3_comfyui_cache.py), [`scripts/setup_isolated_account.py`](scripts/setup_isolated_account.py))**:
-  - `build-wheelhouse` and `publish-wheelhouse` package deterministic SHA-256-locked `comfyui-wheelhouse-<commit>-<pytag>.tar.gz` bundles targeting Colab Linux x86_64 (`py311`/`py312`) while excluding preinstalled heavy packages (`torch`, `torchvision`, `torchaudio`, `triton`, `nvidia-*`).
+  - `build-wheelhouse` and `publish-wheelhouse` package deterministic SHA-256-locked `comfyui-wheelhouse-<commit>-<pytag>.tar.gz` bundles targeting Colab Linux x86_64 (`py311`/`py312`/`py313`, `manylinux_2_28_x86_64`) while excluding preinstalled heavy packages (`torch`, `torchvision`, `torchaudio`, `triton`, `nvidia-*`) and verified-optional headless asset packages (`comfyui-workflow-templates*`, `comfyui-embedded-docs`; `comfyui-frontend-package` is retained).
   - `scripts/setup_isolated_account.py --sync-shared-caches` discovers and verifies commit-matching wheelhouse bundles across accounts alongside the source archive. The remote worker prefers offline `pip install --no-index --find-links=...` and emits `WHEELHOUSE_FALLBACK_PYPI` when falling back to PyPI.
 - **F3 Dual-Track Parallel Setup ([`h3_remote_worker.py`](h3_remote_worker.py))**:
   - Runs `ensure_comfy()` and `restore_weights()` concurrently via `ThreadPoolExecutor(max_workers=2)` with a shared `abort_event`, thread-safe token refresh, and thread-safe state/failure recording so an error in either track cancels the other promptly and reports the exact failing stage.

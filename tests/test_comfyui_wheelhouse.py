@@ -70,8 +70,11 @@ class TestNormalizationAndFiltering(unittest.TestCase):
         self.assertEqual(normalize_python_tag("py312"), "py312")
         self.assertEqual(normalize_python_tag("cp311"), "py311")
         self.assertEqual(normalize_python_tag("312"), "py312")
+        self.assertEqual(normalize_python_tag("3.13"), "py313")
+        self.assertEqual(normalize_python_tag("cp313"), "py313")
         expected_cur = f"py{sys.version_info.major}{sys.version_info.minor}"
         self.assertEqual(normalize_python_tag(None), expected_cur)
+        self.assertIn("manylinux_2_28_x86_64", cache_mod.DEFAULT_PLATFORMS)
 
     def test_normalize_python_tag_invalid(self):
         for bad in ("", "py27", "py37", "py999", "not-a-tag"):
@@ -90,6 +93,10 @@ class TestNormalizationAndFiltering(unittest.TestCase):
             "triton>=3.0.0  # preinstalled",
             "nvidia_cublas_cu12==12.1.3.1",
             "nvidia-cuda-runtime-cu12>=12.0",
+            "comfyui-workflow-templates==0.11.103",
+            "comfyui-workflow-templates-media-api==0.3.84",
+            "comfyui-embedded-docs==0.5.16",
+            "comfyui-frontend-package==1.58.5",
             "torchsde>=0.2.6",
             "safetensors>=0.4.2",
             "einops==0.8.0",
@@ -98,11 +105,16 @@ class TestNormalizationAndFiltering(unittest.TestCase):
         kept = filter_requirements_lines(lines)
         self.assertIn("# ComfyUI deps", kept)
         self.assertIn("--extra-index-url https://example.invalid/simple", kept)
+        self.assertIn("comfyui-frontend-package==1.58.5", kept)
         self.assertIn("torchsde>=0.2.6", kept)
         self.assertIn("safetensors>=0.4.2", kept)
         self.assertIn("einops==0.8.0", kept)
         self.assertIn("kornia>=0.7.1 ; python_version >= '3.10'", kept)
-        for excluded_prefix in ("torch>=", "torch[cuda]", "TorchVision", "torchaudio", "triton", "nvidia_cublas", "nvidia-cuda"):
+        for excluded_prefix in (
+            "torch>=", "torch[cuda]", "TorchVision", "torchaudio", "triton",
+            "nvidia_cublas", "nvidia-cuda",
+            "comfyui-workflow-templates", "comfyui-embedded-docs",
+        ):
             self.assertFalse(any(line.startswith(excluded_prefix) for line in kept))
 
     def test_filter_requirements_file_deterministic_hash(self):
@@ -385,9 +397,18 @@ class TestPublishAndCli(unittest.TestCase):
                 self.assertEqual(wh312["file_id"], f"id-{wh312['archive_name']}")
                 self.assertEqual(len(uploaded), 3)
 
-                # Verify read-only verify() checks all drive_files (stage source stub so verify finds it).
-                (staging / f"comfyui-{SAMPLE_COMMIT}.tar.gz").write_bytes(b"x" * 999)
-                v_res = verify("oauth2")
+                # Verify read-only verify() checks both staged files and remote-only synced files.
+                fake_meta = {
+                    "id": "src-tar-id",
+                    "size": "999",
+                    "md5Checksum": "src-md5",
+                    "sha256Checksum": "c" * 64,
+                    "trashed": False,
+                }
+                with mock.patch("drive_api.get_file_evidence", return_value=fake_meta):
+                    v_res = verify("oauth2")
+                self.assertIn(f"comfyui-{SAMPLE_COMMIT}.tar.gz", v_res["files"])
+                self.assertTrue(v_res["files"][f"comfyui-{SAMPLE_COMMIT}.tar.gz"]["server_verified"])
                 self.assertIn(wh312["archive_name"], v_res["files"])
                 self.assertTrue(v_res["files"][wh312["archive_name"]]["server_verified"])
 

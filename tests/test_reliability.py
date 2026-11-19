@@ -343,6 +343,81 @@ class DeadlineBoundMetricTest(unittest.TestCase):
                                places=4)
         self.assertGreaterEqual(rel.wilson_interval(73, 73)[0], 0.95)
 
+    def test_models_ready_calibrated_from_coldstart_metrics_and_monotonic_stages(self):
+        # v0.2.1 P3: a run whose 60s poll missed the brief MODELS_READY
+        # window still satisfies condition (2) when audit log records
+        # COLDSTART_METRICS or monotonic WORKER_STARTED -> INFERENCE_COMPLETED
+        # -> VIDEO_VALIDATED progression.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            # Case 1: monotonic WORKER_STARTED -> INFERENCE_COMPLETED -> VIDEO_VALIDATED
+            rm.create_run_manifest(root, TASK, "run-mono", variant="A", budget={})
+            rm.update_run(root, "run-mono", session_id="muse-h3-aaaa1111",
+                          session_state="ACTIVE", task_state="GPU_ALLOCATED")
+            rm.update_run(root, "run-mono", task_state="WORKER_STARTED")
+            rm.update_run(root, "run-mono", task_state="INFERENCE_COMPLETED")
+            rm.update_run(root, "run-mono", task_state="VIDEO_VALIDATED",
+                          artifacts={"local_sha256": SHA, "local_frames": 274})
+            rm.update_run(root, "run-mono", task_state="GPU_STOP_CONFIRMED",
+                          session_state="STOPPED")
+            rm.update_run(root, "run-mono", task_state="DRIVE_VERIFIED",
+                          artifacts={"delivery_state": "DELIVERED",
+                                     "drive_file_id": "drive-file-mono"})
+            rm.update_run(root, "run-mono", task_state="TASK_COMPLETED")
+            completed = rel._stage_times(root, "run-mono")["TASK_COMPLETED"][-1]
+            deadline = _fmt(_parse(completed) + timedelta(hours=1))
+            now = _fmt(_parse(completed) + timedelta(hours=2))
+            _ledger(root, TASK, deadline=deadline)
+            report = rel.compute_reliability(root, now_utc=now)
+        f = report["metrics"]["deadline_bound_e2e_success_rate"]
+        self.assertEqual((f["numerator"], f["denominator"]), (1, 1))
+        self.assertEqual(f["verdicts"][0]["verdict"], "success")
+
+        # Case 2: COLDSTART_METRICS audit event satisfies condition (2)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rm.create_run_manifest(root, TASK, "run-cs", variant="A", budget={})
+            rm.update_run(root, "run-cs", session_id="muse-h3-aaaa2222",
+                          session_state="ACTIVE", task_state="GPU_ALLOCATED")
+            rm.update_run(root, "run-cs", coldstart_metrics={"total_coldstart_sec": 230.9})
+            rm.update_run(root, "run-cs", task_state="VIDEO_VALIDATED",
+                          artifacts={"local_sha256": SHA, "local_frames": 274})
+            rm.update_run(root, "run-cs", task_state="GPU_STOP_CONFIRMED",
+                          session_state="STOPPED")
+            rm.update_run(root, "run-cs", task_state="DRIVE_VERIFIED",
+                          artifacts={"delivery_state": "DELIVERED",
+                                     "drive_file_id": "drive-file-cs"})
+            rm.update_run(root, "run-cs", task_state="TASK_COMPLETED")
+            completed = rel._stage_times(root, "run-cs")["TASK_COMPLETED"][-1]
+            deadline = _fmt(_parse(completed) + timedelta(hours=1))
+            now = _fmt(_parse(completed) + timedelta(hours=2))
+            _ledger(root, TASK, deadline=deadline)
+            report = rel.compute_reliability(root, now_utc=now)
+        f = report["metrics"]["deadline_bound_e2e_success_rate"]
+        self.assertEqual((f["numerator"], f["denominator"]), (1, 1))
+        self.assertEqual(f["verdicts"][0]["verdict"], "success")
+
+    def test_incomplete_run_lacking_models_ready_and_inference_still_fails(self):
+        # Negative test: a run that skipped straight from GPU_ALLOCATED to
+        # VIDEO_VALIDATED without MODELS_READY, COLDSTART_METRICS, or
+        # WORKER_STARTED -> INFERENCE_COMPLETED still fails condition (2).
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rm.create_run_manifest(root, TASK, "run-bad", variant="A", budget={})
+            rm.update_run(root, "run-bad", session_id="muse-h3-aaaa3333",
+                          session_state="ACTIVE", task_state="GPU_ALLOCATED")
+            rm.update_run(root, "run-bad", task_state="VIDEO_VALIDATED",
+                          artifacts={"local_sha256": SHA, "local_frames": 274})
+            rm.update_run(root, "run-bad", task_state="GPU_STOP_CONFIRMED",
+                          session_state="STOPPED")
+            rm.update_run(root, "run-bad", task_state="DRIVE_VERIFIED",
+                          artifacts={"delivery_state": "DELIVERED",
+                                     "drive_file_id": "drive-file-bad"})
+            rm.update_run(root, "run-bad", task_state="TASK_COMPLETED")
+            manifest = rm.load_run_manifest(root, "run-bad")
+            failed = rel._evaluate_run_f(root, manifest)
+        self.assertTrue(any("MODELS_READY" in item for item in failed))
+
 
 if __name__ == "__main__":
     unittest.main()
