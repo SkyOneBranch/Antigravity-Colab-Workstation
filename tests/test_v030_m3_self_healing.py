@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -208,6 +208,25 @@ class M3DriveArchiveRecoveryTests(unittest.TestCase):
 
 
 class M3TokenFreshnessTests(unittest.TestCase):
+    @staticmethod
+    def _fake_google_auth_modules(creds) -> dict[str, ModuleType]:
+        google_mod = ModuleType("google")
+        auth_mod = ModuleType("google.auth")
+        transport_mod = ModuleType("google.auth.transport")
+        requests_mod = ModuleType("google.auth.transport.requests")
+
+        auth_mod.default = lambda scopes=None: (creds, "proj")  # type: ignore[attr-defined]
+        requests_mod.Request = lambda: object()  # type: ignore[attr-defined]
+        transport_mod.requests = requests_mod  # type: ignore[attr-defined]
+        auth_mod.transport = transport_mod  # type: ignore[attr-defined]
+        google_mod.auth = auth_mod  # type: ignore[attr-defined]
+        return {
+            "google": google_mod,
+            "google.auth": auth_mod,
+            "google.auth.transport": transport_mod,
+            "google.auth.transport.requests": requests_mod,
+        }
+
     def test_ensure_token_freshness_refreshes_when_below_threshold(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         soon = (now + datetime.timedelta(seconds=120)).replace(tzinfo=None)
@@ -227,7 +246,7 @@ class M3TokenFreshnessTests(unittest.TestCase):
 
         creds = FakeCreds()
         with mock.patch("auth_support.ensure_adc_isolation"), \
-                mock.patch("google.auth.default", return_value=(creds, "proj")):
+                mock.patch.dict(sys.modules, self._fake_google_auth_modules(creds)):
             res = dt.ensure_token_freshness(min_remaining_sec=900)
 
         self.assertTrue(res["refreshed"])
@@ -251,7 +270,7 @@ class M3TokenFreshnessTests(unittest.TestCase):
 
         creds = FakeCreds()
         with mock.patch("auth_support.ensure_adc_isolation"), \
-                mock.patch("google.auth.default", return_value=(creds, "proj")):
+                mock.patch.dict(sys.modules, self._fake_google_auth_modules(creds)):
             res = dt.ensure_token_freshness(min_remaining_sec=900)
 
         self.assertFalse(res["refreshed"])

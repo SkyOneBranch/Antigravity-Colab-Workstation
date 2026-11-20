@@ -1,5 +1,5 @@
 {
-  "generated_utc": "2026-11-19",
+  "generated_utc": "2026-11-20",
   "source": "~/workspace/Muse_Colab_H3_Drive_v3/ (production baseline; verbatim copies SHA-256-verified at migration)",
   "note": "Every file in this repo except SOURCE_MANIFEST.json itself. Regenerate after any change; verify with scripts/verify_manifest.py. Excluded by policy and therefore absent: model weights, poster binary, MP4s, live ledgers/sessions/depot state, .venv, __pycache__.",
   "files": [
@@ -1307,8 +1307,8 @@
     },
     {
       "path": "tests/test_v030_m3_self_healing.py",
-      "size_bytes": 10559,
-      "sha256": "fe8e74d776dd314c21be2dbd764470668076f7622265119b931808d688ac0264",
+      "size_bytes": 11476,
+      "sha256": "52547a1404e3f0a2941d5cf93f3929476462c5129be3d58bb663b9e1e3ef9058",
       "role": "Tests"
     },
     {
