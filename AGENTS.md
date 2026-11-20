@@ -16,6 +16,11 @@ This repository is a standalone, fail-closed **Google Colab GPU workstation** dr
   - `h3_remote_worker.py`: dual-track `ensure_comfy` || `restore_weights` into `/content/nvme_models/h3` (`H3_NVME_MODELS_DIR`) with atomic symlinks, offline wheelhouse (`WHEELHOUSE_FALLBACK_PYPI` on fallback), auto `--highvram --disable-mmap` for VRAM `>= 76800` MiB (`H3_COMFY_VRAM_FLAGS`), and `COLDSTART_METRICS_JSON` telemetry.
   - `drive_depot.py remote-seed`: in-cloud HF-to-Drive seeding gated by `--allow-drive-write --allow-large-transfer --confirm-remote-seed` with short-lived `drive.file` token, watchdog protection, and unconditional `finally` shutdown verification.
   - `scripts/reliability_report.py`: reports cold-start P50/P90 and `wheelhouse_hit_rate` from persisted `COLDSTART_METRICS_JSON` in `model_cache/run_manifests/<run_id>.json`.
+- **v0.3.0 Self-Healing & Controlled Warm Pool (M1–M4)**:
+  - **M1 Elastic Backoff (`h3_budget.py`, `h3_controller.py`)**: classifies allocation failures (`AUTH_FATAL`, `QUOTA_EXCEEDED`, `CAPACITY_TRANSIENT`, `TRANSPORT_TRANSIENT`, `UNKNOWN_FATAL`) and retries transient capacity rounds (`--allocation-rounds 1..5`, `15/45/90s ±20%`) within task deadline margins.
+  - **M2 Bundled Bootstrap (`h3_bootstrap_stage1.py`, `h3_bootstrap_stage2.py`)**: `--bootstrap-mode bundled|legacy` (default `bundled`) separates Stage 1 (`0600` tokens + Drive probe) from Stage 2 (`h3_remote_worker.py` + `task.json`) with path-traversal checks and manifest round-trip telemetry.
+  - **M3 Self-Healing & 0-GPU Drive Recovery (`h3_controller.py`, `h3_drive_token.py`)**: transient network/TLS retry (`5x`: `5/10/20/30s`) on host polling/inspect/resume, preflight token freshness check (`>= 900s` silent refresh), and 0-CU `recover_from_drive_archive()` when the host crashes after GPU shutdown.
+  - **M4 Warm Pool (`--keep-warm-ttl 60..900`, `h3_gpu_lease_registry.py`, `h3_shutdown_executor.py`, `scripts/verify_shutdown.sh`)**: reuses healthy `:8188` sessions across consecutive runs within `14400s` wall / `25.0 CU` session caps; fails closed to immediate stop on any error; cross-task guardian reclaims expired warm leases unconditionally; `./scripts/verify_shutdown.sh --stop-warm` reclaims warm leases on demand while default `verify_shutdown.sh` stays 100% read-only.
 
 ## 2. Three-Layer Account & Secret Isolation
 
@@ -32,7 +37,7 @@ This repository is a standalone, fail-closed **Google Colab GPU workstation** dr
 
 - Hard budget caps: **`30.0 CU` per production task** and **`25.0 CU` per single Colab runtime session**. Do NOT modify `config/*.yaml` or `h3_budget.py` / `h3_contract.py` constants unless updating contract tests intentionally.
 - Never allocate a live Colab runtime (`colab new` or `scripts/run_h3_task.sh --confirm-live ...`) during documentation, refactoring, CI, or review work unless explicitly approved for a production run.
-- Always run `./scripts/preflight.sh` (`0 CU`) before any live task, wrap macOS live runs with `/usr/bin/caffeinate -dimsu`, and run `./scripts/verify_shutdown.sh` + `./scripts/check_budget.sh` afterward.
+- Always run `./scripts/preflight.sh` (`0 CU`) before any live task, wrap macOS live runs with `/usr/bin/caffeinate -dimsu`, and run `./scripts/verify_shutdown.sh` (or `./scripts/verify_shutdown.sh --stop-warm` when reclaiming a warm-pooled session) + `./scripts/check_budget.sh` afterward.
 - Note on cross-project callers: `scripts/preflight.sh`, `scripts/run_h3_task.sh`, and `scripts/check_outputs.sh` resolve relative `--task-spec` / MP4 paths against `CALLER_PWD` before `cd`ing to repo root, whereas relative `ref_image_*.local_path` inside a `TaskSpec` still resolves from repo root (cross-project specs should use `drive_file_id` or an absolute `local_path`).
 
 ## 4. Verification & Manifest Discipline

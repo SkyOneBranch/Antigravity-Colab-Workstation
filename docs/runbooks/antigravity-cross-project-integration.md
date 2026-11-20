@@ -97,9 +97,9 @@ TASK_ID="episode-01-prod"
 
 `preflight.sh` resolves relative `$SPEC` against `~/projects/my-video-app`, validates `TaskSpec`, verifies credential isolation and account match, checks Drive depot visibility, and checks CU budget without allocating any GPU.
 
-### Step 2: Live Render + Delivery + Auto-Recovery
+### Step 2: Live Render + Delivery + Auto-Recovery (v0.3.0)
 
-On macOS, always wrap live execution with `/usr/bin/caffeinate -dimsu` so display/idle sleep never interrupts heartbeat telemetry or Drive archival:
+On macOS, always wrap live execution with `/usr/bin/caffeinate -dimsu` so display/idle sleep never interrupts heartbeat telemetry or Drive archival. Use `--deliver` (or `run --auto-recover` — pass at most one, they are mutually exclusive):
 
 ```bash
 /usr/bin/caffeinate -dimsu "$COLAB_WS/scripts/run_h3_task.sh" \
@@ -108,10 +108,17 @@ On macOS, always wrap live execution with `/usr/bin/caffeinate -dimsu` so displa
   --production-task-id "$TASK_ID" \
   --authorize-new-task \
   --deliver \
-  --auto-recover
+  --allocation-rounds 3 \
+  --bootstrap-mode bundled
 ```
 
 On Linux, omit `/usr/bin/caffeinate -dimsu`.
+
+**v0.3.0 Resilience & Batch Warm-Pool Flags**:
+- **`--allocation-rounds <1..5>`**: controls outer elastic backoff rounds (`15s / 45s / 90s ±20%`) around `("G4", "G4", "A100_HIGH_MEM")` on transient HTTP 503/412 capacity errors (default `3` for `--deliver` / `--auto-recover`, `1` for raw `run`).
+- **`--bootstrap-mode <bundled|legacy>`**: defaults to `bundled` (2-stage tar upload/exec with path-traversal protection); pass `legacy` only for diagnostic fallback.
+- **`--keep-warm-ttl <60..900>`**: optional controlled warm pool for back-to-back cross-project renders. Keeps a healthy ComfyUI `:8188` runtime alive for `<sec>` after delivery (bounded by `25.0 CU` per session and `14400s` max wall time) so the next cross-project render reuses it in `< 5s`. Any error forces an immediate fail-closed stop.
+- **Idempotent Drive 0-GPU Recovery**: if the caller host disconnects or sleeps while the remote worker finishes and uploads to `Muse-H3-Video-Outputs`, re-running the exact same `--deliver` (or `--auto-recover`) command detects the stopped GPU and executes `recover_from_drive_archive()` at **0 CU** to download, validate, and mark the run `TASK_COMPLETED` without allocating a new GPU.
 
 ### Step 3: Output QA & Delivery Inspection
 
@@ -131,6 +138,13 @@ Find the delivered file under `$COLAB_WS/output/<run_id>/<output_prefix>.mp4` (a
 ```
 
 Confirm `"rate": 0.0`, `"sessions": []`, and `GPU_STOP_VERIFIED: no active sessions.`.
+
+If your batch used `--keep-warm-ttl <60..900>` and no more renders are queued, reclaim the warm session immediately and verify zero billing:
+
+```bash
+"$COLAB_WS/scripts/verify_shutdown.sh" --stop-warm
+"$COLAB_WS/scripts/check_budget.sh"
+```
 
 ---
 

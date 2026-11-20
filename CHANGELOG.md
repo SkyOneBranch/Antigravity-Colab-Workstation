@@ -1,5 +1,65 @@
 # CHANGELOG
 
+## v0.3.0 — 2026-11-19 — Self-Healing & Controlled Warm Pool (M1–M4)
+
+Resilience, bootstrap round-trip reduction, host-disconnect self-healing, and
+budget-bounded warm session reuse. All frozen budget (`30.0 CU` task /
+`25.0 CU` session / `0.75 CU` cleanup reserve / `14400s` max wall) and
+three-layer account-isolation invariants remain strictly enforced.
+
+### Added / Changed
+
+- **M1 GPU 503 Elastic Backoff & Error Classification (`h3_budget.py`, `h3_controller.py`, `scripts/run_h3_task.sh`)**:
+  - Added `classify_allocation_error()` (`AUTH_FATAL`, `QUOTA_EXCEEDED`,
+    `CAPACITY_TRANSIENT`, `TRANSPORT_TRANSIENT`, `UNKNOWN_FATAL`) and
+    `compute_backoff_delay()` (`15s / 45s / 90s ±20%` jitter).
+  - Added `--allocation-rounds <1..5>` (default `3` for `deliver` /
+    `--auto-recover`, `1` for raw `run`) wrapping `("G4", "G4", "A100_HIGH_MEM")`
+    with deadline-margin gating, fail-fast on fatal/quota errors, and
+    `GPU_ALLOCATION_BACKOFF` audit events.
+- **M2 Two-Stage Bundled Bootstrap (`h3_bootstrap_stage1.py`, `h3_bootstrap_stage2.py`, `h3_controller.py`, `scripts/run_h3_task.sh`)**:
+  - Added `--bootstrap-mode bundled|legacy` (default `bundled`).
+  - Stage 1 bundles `0600` downscoped tokens and Drive probe scripts (never
+    `h3_remote_worker.py`), extracts with strict path-traversal rejection, and
+    must emit `MUSE_DRIVE_DOWNLOAD_PROBE_OK` before Stage 2 (`h3_remote_worker.py`
+    + `task.json`) is built or uploaded.
+  - Persists `bootstrap` telemetry (`mode`, `bootstrap_wall_sec`,
+    `cli_round_trips`) in run manifests.
+- **M3 Host Disconnect Self-Healing & Drive 0-GPU Recovery (`h3_controller.py`, `h3_drive_token.py`)**:
+  - Added `_call_with_transient_retry()` (`5x`: `5/10/20/30s`) across host
+    polling, inspection, delivery verification, and resume paths.
+  - Added `ensure_token_freshness(min_remaining_sec=900)` in `h3_drive_token.py`
+    and wired `token_freshness` into `0-CU` preflight.
+  - Added `recover_from_drive_archive()` so `--deliver` / `--auto-recover`
+    recovers archived MP4s from `Muse-H3-Video-Outputs` at **0 CU** when the
+    host disconnects after the remote GPU has already stopped.
+- **M4 Controlled Warm Session Pool (`h3_gpu_lease_registry.py`, `h3_shutdown_executor.py`, `scripts/run_shutdown_guardian.py`, `h3_run_manifest.py`, `h3_reliability.py`, `h3_remote_worker.py`, `h3_warm_health_probe.py`, `h3_controller.py`, `scripts/run_h3_task.sh`, `scripts/verify_shutdown.sh`, `.agents/pre_tool_guard.py`)**:
+  - Added `--keep-warm-ttl <sec>` (`0` or `60..900`; default `0`): keeps healthy
+    ComfyUI `:8188` sessions warm within `MAX_SESSION_SECONDS` (`14400s`) and
+    `PER_SESSION_BUDGET_CU` (`25.0 CU`) caps, enabling `< 5s` warm reuse
+    (`warm_session_reused: true`) after `MUSE_WARM_HEALTH_OK` verification.
+  - Extended `LeaseRegistry` with `mark_warm_idle()`, `claim_warm_lease()`, and
+    `find_warm_leases()`; extended `RunManifest` with `WARM_POOLED` +
+    `record_warm_session_stopped()` and `ReliabilityReport` with
+    `warm_session_hits` / `warm_pooled_active_runs`.
+  - Updated `h3_shutdown_executor.py` (`--stop-warm`),
+    `scripts/run_shutdown_guardian.py` (unconditional cross-task reclamation of
+    expired warm leases), `scripts/verify_shutdown.sh` (read-only by default;
+    `--stop-warm` reclaims warm leases then asserts `sessions == []` and
+    `rate == 0.0`), and `.agents/pre_tool_guard.py` (permits
+    `./scripts/verify_shutdown.sh --stop-warm` and
+    `scripts/verify_shutdown.sh --stop-warm` while keeping all credential and
+    unmanaged-`colab` blocks enforced).
+
+### Safety Gates & Offline CI Verification (0.00 CU)
+
+- All v0.3.0 modules, wrappers, and guards are covered by offline unit tests
+  (`tests/test_v030_m1_backoff.py`, `tests/test_v030_m2_bundled_bootstrap.py`,
+  `tests/test_v030_m3_self_healing.py`, `tests/test_v030_m4_controller_worker.py`,
+  `tests/test_v030_m4_warm_infra.py`, `tests/test_v030_scripts_guard.py`),
+  `scripts/secret_scan.py`, `scripts/check_docs_index.py`, and
+  `tests/run_ci_tests.py` with **0.00 CU** spent.
+
 ## v0.2.1 — 2026-11-19 — Zero-CU Polish (P1–P3)
 
 Targeted post-benchmark polish based on the `v0.2.0` live A100 run (`489s ->

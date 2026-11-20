@@ -11,14 +11,14 @@
     },
     {
       "path": ".agents/pre_tool_guard.py",
-      "size_bytes": 4242,
-      "sha256": "5a4e2bd29c2baf9e87a93307c18a2f9a9b635b5c3ce3bfe4f44d71b538ab742d",
+      "size_bytes": 4276,
+      "sha256": "490ec1248adb8dd148d5669cc28e94ee8cb32d9d5bda8ebeb2bf25bf38f2d3ab",
       "role": "Supporting file"
     },
     {
       "path": ".agents/skills/colab-h3-video/SKILL.md",
-      "size_bytes": 2770,
-      "sha256": "cae07ee2e5b0909319b7c8b53e3e9bf4cd77e996cfaf4c962eaf8bad4826250c",
+      "size_bytes": 3910,
+      "sha256": "2e662423ea73b6795299b976adedf35d0f1c5688bc833e9a18382aba8f0b3f08",
       "role": "Supporting file"
     },
     {
@@ -53,20 +53,20 @@
     },
     {
       "path": "AGENTS.md",
-      "size_bytes": 5843,
-      "sha256": "e946b8ad9f94a6b0bc39df492a644ee5da73055e6c9407ccf0aec58ee604788f",
+      "size_bytes": 7388,
+      "sha256": "d58e4db44b3ec5269749f2b3ac1dd13df1628a9c1d38d154ccdf87445001278b",
       "role": "Supporting file"
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 13667,
-      "sha256": "e76eec3ca04fd5096333a93b1db517e6f3ef2dc23391a1d0b1f173d32807896b",
+      "size_bytes": 17730,
+      "sha256": "2eb418041d0962c2643d504065a0d6e6b7d92f2f063aeda0666c869de4172aa9",
       "role": "Supporting file"
     },
     {
       "path": "README.md",
-      "size_bytes": 10394,
-      "sha256": "2a855ca738754cce787618505349312bf3ed3fa5ded1e8238b1cd7f65e08fc92",
+      "size_bytes": 13016,
+      "sha256": "c0733d1b14e75c5c71ab82855f1733265ed4f20ae7d3b7afe6a609c9ed436d66",
       "role": "Supporting file"
     },
     {
@@ -497,8 +497,8 @@
     },
     {
       "path": "docs/runbooks/antigravity-cross-project-integration.md",
-      "size_bytes": 8552,
-      "sha256": "48916240c44f1bede12cc5ea7057be4948572ad29e3785d6c34a5ab249df7219",
+      "size_bytes": 10127,
+      "sha256": "c6ab180f91eaa1c810eecb7d369de02ec45e29ec8d8d18b39d564fb2e32c1b50",
       "role": "Documentation / evidence"
     },
     {
@@ -616,9 +616,21 @@
       "role": "Example (placeholder values only)"
     },
     {
+      "path": "h3_bootstrap_stage1.py",
+      "size_bytes": 3990,
+      "sha256": "fcc98c65020b4be421516cb501cc559202f72fc5f67c144f6b9083b370467432",
+      "role": "Supporting file"
+    },
+    {
+      "path": "h3_bootstrap_stage2.py",
+      "size_bytes": 3930,
+      "sha256": "09c7f38c4b838933aed5a786b1266066b26070be54146020b631e442f239b862",
+      "role": "Supporting file"
+    },
+    {
       "path": "h3_budget.py",
-      "size_bytes": 23502,
-      "sha256": "3cabe7fce7abaf5400da37daceb0a82d2af5461713f34ea0bf7ff72b4af001ba",
+      "size_bytes": 26340,
+      "sha256": "bafb25c3576d81e700008949f23f72cf310f6d584ee66b47d543154895871b48",
       "role": "Per-task CU ledger (30 CU) + GPU choice policy (G4/G4/A100_HIGH_MEM)"
     },
     {
@@ -635,8 +647,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 207817,
-      "sha256": "f381a6b6bd8586660788f7981bc0a0f2c47abcb6377fcd59accdd9ae505a72c0",
+      "size_bytes": 249447,
+      "sha256": "1147867640f71c7be14ad74dd015afb3968133b2b128796a4629eef22f254f8a",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -659,8 +671,8 @@
     },
     {
       "path": "h3_drive_token.py",
-      "size_bytes": 4623,
-      "sha256": "75cc70f4919afa83203ded40de91ddd7e9bbe12fc879c8efd04afd2cbd49dbc7",
+      "size_bytes": 6601,
+      "sha256": "0e83aedb8bae36e9f300872ae9433f5496f0d41640dc7ca1a273227cc2d10731",
       "role": "Supporting file"
     },
     {
@@ -683,8 +695,8 @@
     },
     {
       "path": "h3_gpu_lease_registry.py",
-      "size_bytes": 28053,
-      "sha256": "0f0a9143f3230c3d0a31b4d19adbc9ae0dc684e0fa0beacfdf1689faccabf967",
+      "size_bytes": 35205,
+      "sha256": "09a0bd7779284f167ca7f0f69ed16936cc928a296badd4833b40b4dec38ed3b6",
       "role": "Supporting file"
     },
     {
@@ -737,14 +749,14 @@
     },
     {
       "path": "h3_reliability.py",
-      "size_bytes": 27960,
-      "sha256": "8dc3519267d33eea97bdf1caea2128e44815f9d7b7a4e8b3232b4ade86bda3fb",
+      "size_bytes": 28493,
+      "sha256": "9970a569170ed4814e6eaed570b40eda0e1acf3815c235968ccccc6f5eb54fbe",
       "role": "Supporting file"
     },
     {
       "path": "h3_remote_worker.py",
-      "size_bytes": 94033,
-      "sha256": "5c5613a14a37a6647d574529b273171021f48b0cca913d02ffebd1a39004d525",
+      "size_bytes": 99148,
+      "sha256": "81133ac3745ac64f11c68bd1b599afa2efb037f91923f739f354e094b6d3ff86",
       "role": "Remote ComfyUI worker: restore, inference, find_rendered_video, assemble"
     },
     {
@@ -755,8 +767,8 @@
     },
     {
       "path": "h3_run_manifest.py",
-      "size_bytes": 22343,
-      "sha256": "cb7f9f357df83c579436e1c0a1cdb4b342d0a6930fe5a9f15c327dc617182d06",
+      "size_bytes": 24801,
+      "sha256": "bd5bb38ac92f5ade9a0819462f70d3f681f8900d012c880966dcc4e7cb8cfa84",
       "role": "Supporting file"
     },
     {
@@ -767,8 +779,8 @@
     },
     {
       "path": "h3_shutdown_executor.py",
-      "size_bytes": 16181,
-      "sha256": "548e46ed7ca5d1bc7725c0ae505379e1c98e2d757cf3dce83fa08c00dce65e56",
+      "size_bytes": 20145,
+      "sha256": "5eba3d023fd471f7a7f47c613fa218635039b1ad9b5dadfb2de41f34af132b04",
       "role": "Supporting file"
     },
     {
@@ -788,6 +800,12 @@
       "size_bytes": 10613,
       "sha256": "254c9fcf04f7c0a173fc0214a6fe4947038370d8d2193010741804d59b297cec",
       "role": "Local final-video validation + poster-tail PSNR QA"
+    },
+    {
+      "path": "h3_warm_health_probe.py",
+      "size_bytes": 1619,
+      "sha256": "94792031e92d8935e92d7b474188e2720cb444f1615f739f63361430337aaad2",
+      "role": "Supporting file"
     },
     {
       "path": "h3_worker_launcher.py",
@@ -947,8 +965,8 @@
     },
     {
       "path": "scripts/reliability_report.py",
-      "size_bytes": 6021,
-      "sha256": "548f8a98e349ace2c7e455dd37562742fa2dd00b2dbed1640b7a7486db1daabb",
+      "size_bytes": 6400,
+      "sha256": "0ab4313d9c3312e9ab8396747753ded1c1fc5133cb1dfa9333870805f0debc49",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -959,14 +977,14 @@
     },
     {
       "path": "scripts/run_h3_task.sh",
-      "size_bytes": 8183,
-      "sha256": "05c1b3bc55c01d89fcc16495aba15be07cca9f4ad8582015ebe2df12da6748b7",
+      "size_bytes": 10432,
+      "sha256": "28b8738b51896d0eb0b34dba9a61ab1bb23b0cf106bd5d62672f3b95b0423394",
       "role": "Operator wrapper / offline check"
     },
     {
       "path": "scripts/run_shutdown_guardian.py",
-      "size_bytes": 3336,
-      "sha256": "4ac53d0a9506840c2fa625fe4fa9b889294c626f20308bd69dd8c745eaaf1966",
+      "size_bytes": 5535,
+      "sha256": "4c57df05c53bd494dc5b8932d7cf7ede2d2420a7c0eaeae556092adc44823bd9",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -1001,8 +1019,8 @@
     },
     {
       "path": "scripts/verify_shutdown.sh",
-      "size_bytes": 1251,
-      "sha256": "c550889fdcd97849502da8f083c7226b77012e292ddc3f6699882e86a94c18bd",
+      "size_bytes": 2091,
+      "sha256": "14fb51ebf2f5b9da8682f9e9e2678cad431040f379f4359b6d5bec650efb0277",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -1273,6 +1291,42 @@
       "path": "tests/test_task_spec.py",
       "size_bytes": 30717,
       "sha256": "2ab467ef49872ff9bc9539505e01fe56002d5e6f210721975bdd2bee523875c7",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m1_backoff.py",
+      "size_bytes": 11701,
+      "sha256": "e33e602361834932929be89f9a70f0f896cbb7fda17e5bc7033833f95f0f9e09",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m2_bundled_bootstrap.py",
+      "size_bytes": 15053,
+      "sha256": "73b12ae5326357b9990c099f3a553a95a6ade57510932426a29e6fc7c0fdecde",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m3_self_healing.py",
+      "size_bytes": 10559,
+      "sha256": "fe8e74d776dd314c21be2dbd764470668076f7622265119b931808d688ac0264",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m4_controller_worker.py",
+      "size_bytes": 18523,
+      "sha256": "766d6351c5848722d77fcaf6efa74dea3b8650777c866ae113136dff932e6214",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m4_warm_infra.py",
+      "size_bytes": 26988,
+      "sha256": "f0138c7b6fddcfde094a4d1c87014d4f439f084942e24e08d117fbb9a3d7014b",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_scripts_guard.py",
+      "size_bytes": 12974,
+      "sha256": "1ba2c75e123d9da1033e238582a42e5056352bab671bcb0bc5bbd81c960960c4",
       "role": "Tests"
     },
     {

@@ -33,6 +33,7 @@
 #   --fresh-inference
 #   --task-spec SPEC | --variant A|B --run-id ID --production-task-id ID [--authorize-new-task]
 #   [--task-deadline-utc UTC] [--auto-recover] [--max-task-attempts N]
+#   [--allocation-rounds N] [--bootstrap-mode bundled|legacy] [--keep-warm-ttl SEC]
 # The controller itself enforces: 30 CU task budget, 25 CU per-session cap,
 # G4_THEN_A100_HIGHMEM policy, pinned ComfyUI commit, and (TASK-006 P0-B)
 # the noninteractive Drive download preflight before allocation. The
@@ -47,18 +48,22 @@ REPO="$(pwd)"
 REPO_REAL="$(pwd -P)"
 CONFIRM_LIVE=0; VARIANT=""; TASK_SPEC=""; RUN_ID=""; TASK_ID=""; AUTHORIZE_NEW_TASK=0
 DELIVER=0; AUTO_RECOVER=0; MAX_ATTEMPTS=""; TASK_DEADLINE=""
+KEEP_WARM_TTL=""; ALLOCATION_ROUNDS=""; BOOTSTRAP_MODE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --confirm-live) CONFIRM_LIVE=1; shift ;;
-    --variant) VARIANT="$2"; shift 2 ;;
-    --task-spec) TASK_SPEC="$2"; shift 2 ;;
-    --run-id) RUN_ID="$2"; shift 2 ;;
-    --production-task-id) TASK_ID="$2"; shift 2 ;;
+    --variant) [ $# -ge 2 ] || { echo "REFUSED: --variant requires a value" >&2; exit 2; }; VARIANT="$2"; shift 2 ;;
+    --task-spec) [ $# -ge 2 ] || { echo "REFUSED: --task-spec requires a value" >&2; exit 2; }; TASK_SPEC="$2"; shift 2 ;;
+    --run-id) [ $# -ge 2 ] || { echo "REFUSED: --run-id requires a value" >&2; exit 2; }; RUN_ID="$2"; shift 2 ;;
+    --production-task-id) [ $# -ge 2 ] || { echo "REFUSED: --production-task-id requires a value" >&2; exit 2; }; TASK_ID="$2"; shift 2 ;;
     --authorize-new-task) AUTHORIZE_NEW_TASK=1; shift ;;
     --deliver) DELIVER=1; shift ;;
     --auto-recover) AUTO_RECOVER=1; shift ;;
-    --max-task-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
-    --task-deadline-utc) TASK_DEADLINE="$2"; shift 2 ;;
+    --max-task-attempts) [ $# -ge 2 ] || { echo "REFUSED: --max-task-attempts requires a value" >&2; exit 2; }; MAX_ATTEMPTS="$2"; shift 2 ;;
+    --task-deadline-utc) [ $# -ge 2 ] || { echo "REFUSED: --task-deadline-utc requires a value" >&2; exit 2; }; TASK_DEADLINE="$2"; shift 2 ;;
+    --keep-warm-ttl) [ $# -ge 2 ] || { echo "REFUSED: --keep-warm-ttl requires a value" >&2; exit 2; }; KEEP_WARM_TTL="$2"; shift 2 ;;
+    --allocation-rounds) [ $# -ge 2 ] || { echo "REFUSED: --allocation-rounds requires a value" >&2; exit 2; }; ALLOCATION_ROUNDS="$2"; shift 2 ;;
+    --bootstrap-mode) [ $# -ge 2 ] || { echo "REFUSED: --bootstrap-mode requires a value" >&2; exit 2; }; BOOTSTRAP_MODE="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -79,7 +84,7 @@ if [ -n "$TASK_SPEC" ] && [ "$CALLER_PWD" != "$REPO_REAL" ]; then
 fi
 if [ "$CONFIRM_LIVE" -ne 1 ]; then
   echo "REFUSED: run_h3_task.sh requires --confirm-live. This creates a paid GPU session." >&2
-  echo "Usage: $0 --confirm-live --production-task-id TASK (--task-spec SPEC | --variant A|B) --run-id h3-... [--deliver | --auto-recover] [--max-task-attempts N] [--task-deadline-utc UTC]" >&2
+  echo "Usage: $0 --confirm-live --production-task-id TASK (--task-spec SPEC | --variant A|B) --run-id h3-... [--deliver | --auto-recover] [--max-task-attempts N] [--task-deadline-utc UTC] [--allocation-rounds N] [--bootstrap-mode bundled|legacy] [--keep-warm-ttl SEC]" >&2
   exit 2
 fi
 if [ -n "$VARIANT" ] && [ -n "$TASK_SPEC" ]; then echo "REFUSED: --variant and --task-spec conflict; pass exactly one" >&2; exit 2; fi
@@ -91,6 +96,32 @@ if [ -n "$MAX_ATTEMPTS" ]; then
   case "$MAX_ATTEMPTS" in
     1|2|3) ;;
     *) echo "REFUSED: --max-task-attempts must be 1, 2 or 3" >&2; exit 2 ;;
+  esac
+fi
+if [ -n "$KEEP_WARM_TTL" ]; then
+  case "$KEEP_WARM_TTL" in
+    ''|*[!0-9]*)
+      echo "REFUSED: --keep-warm-ttl must be 0 or an integer in 60..900 (got $KEEP_WARM_TTL)" >&2
+      exit 2
+      ;;
+    *)
+      if [ "$KEEP_WARM_TTL" -ne 0 ] && { [ "$KEEP_WARM_TTL" -lt 60 ] || [ "$KEEP_WARM_TTL" -gt 900 ]; }; then
+        echo "REFUSED: --keep-warm-ttl must be 0 or an integer in 60..900 (got $KEEP_WARM_TTL)" >&2
+        exit 2
+      fi
+      ;;
+  esac
+fi
+if [ -n "$ALLOCATION_ROUNDS" ]; then
+  case "$ALLOCATION_ROUNDS" in
+    1|2|3|4|5) ;;
+    *) echo "REFUSED: --allocation-rounds must be an integer in 1..5 (got $ALLOCATION_ROUNDS)" >&2; exit 2 ;;
+  esac
+fi
+if [ -n "$BOOTSTRAP_MODE" ]; then
+  case "$BOOTSTRAP_MODE" in
+    bundled|legacy) ;;
+    *) echo "REFUSED: --bootstrap-mode must be bundled or legacy (got $BOOTSTRAP_MODE)" >&2; exit 2 ;;
   esac
 fi
 # --run-id is required for a single run; the deliver loop derives a
@@ -145,6 +176,9 @@ if [ -n "$TASK_SPEC" ]; then EXTRA+=(--task-spec "$TASK_SPEC"); else EXTRA+=(--v
 if [ -n "$RUN_ID" ]; then EXTRA+=(--run-id "$RUN_ID"); fi
 if [ -n "$TASK_DEADLINE" ]; then EXTRA+=(--task-deadline-utc "$TASK_DEADLINE"); fi
 if [ -n "$MAX_ATTEMPTS" ]; then EXTRA+=(--max-task-attempts "$MAX_ATTEMPTS"); fi
+if [ -n "$KEEP_WARM_TTL" ]; then EXTRA+=(--keep-warm-ttl "$KEEP_WARM_TTL"); fi
+if [ -n "$ALLOCATION_ROUNDS" ]; then EXTRA+=(--allocation-rounds "$ALLOCATION_ROUNDS"); fi
+if [ -n "$BOOTSTRAP_MODE" ]; then EXTRA+=(--bootstrap-mode "$BOOTSTRAP_MODE"); fi
 if [ "$DELIVER" -eq 1 ]; then
   exec "$PY" h3_controller.py deliver --execute --confirm-gpu --authorize-task-gpu --allow-g4 --allow-a100-highmem --fresh-inference --production-task-id "$TASK_ID" "${EXTRA[@]}"
 fi

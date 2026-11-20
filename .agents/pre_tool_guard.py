@@ -37,6 +37,7 @@ ALLOW_PREFIXES = (
     "./scripts/check_budget.sh",
     "./scripts/verify_drive.sh",
     "./scripts/verify_shutdown.sh",
+    "scripts/verify_shutdown.sh",
     "./scripts/check_outputs.sh",
     "./scripts/run_h3_task.sh",
     "./scripts/install_macos_guardian.sh --status",
