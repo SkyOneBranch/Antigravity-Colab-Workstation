@@ -87,12 +87,7 @@ _CMD_FAILURE_LOCAL = threading.local()
 
 
 def _job_stage_for(name: str) -> str:
-    mapped = WORKER_PHASE_TO_JOB_STAGE.get(name)
-    if mapped is not None:
-        return mapped
-    if name in ("dual_track_setup", "link_models"):
-        return "RESTORING_MODELS"
-    return name
+    return WORKER_PHASE_TO_JOB_STAGE.get(name, name)
 
 
 def _write_job_state_safe(stage: str, **kwargs) -> None:
@@ -528,45 +523,94 @@ def _is_transient_api_error(exc) -> bool:
     return isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError))
 
 
-def _find_prompt_by_client_id(server, client_id, timeout=10):
-    """Look for a prompt submitted under client_id in /queue (running +
-    pending) and /history. Returns the prompt_id, or None when the
-    submit never landed. A lookup failure returns None — the caller
-    treats 'not found' as 'not submitted', never as proof of failure."""
+PROMPT_RECONCILE_DELAYS = (2, 4, 8, 12, 16)
+
+
+def _find_prompt_by_client_id(server, client_id, timeout=10) -> tuple[str, str | None]:
+    """Three-state reconciliation lookup for a prompt submitted under
+    `client_id` across `/queue` (running + pending) and `/history` (v0.3.1 P1-3).
+
+    Returns:
+      - ("found", prompt_id): prompt is confirmed present in /queue or /history.
+      - ("absent", None): BOTH /queue and /history responded cleanly as JSON
+        objects and neither contains `client_id`.
+      - ("unknown", error_detail): at least one of /queue or /history failed
+        (timeout, connection reset, HTTP/JSON error) and the prompt was not
+        found in the other. Callers MUST NOT treat "unknown" as "absent" or
+        blindly re-POST /prompt.
+    """
+    errors: list[str] = []
+    queue = None
     try:
         queue = get_json(server + '/queue', timeout=timeout)
-    except Exception:
-        queue = {}
-    for key in ('queue_running', 'queue_pending'):
-        for item in (queue or {}).get(key) or []:
-            try:
-                if len(item) >= 4 and isinstance(item[3], dict) \
-                        and item[3].get('client_id') == client_id:
-                    return item[1]
-            except Exception:
-                continue
+        if not isinstance(queue, dict):
+            errors.append(f'/queue returned non-object ({type(queue).__name__})')
+            queue = None
+    except Exception as e:  # noqa: BLE001
+        errors.append(f'/queue error: {type(e).__name__}: {str(e)[:200]}')
+        queue = None
+    if isinstance(queue, dict):
+        for key in ('queue_running', 'queue_pending'):
+            for item in queue.get(key) or []:
+                try:
+                    if len(item) >= 4 and isinstance(item[3], dict) \
+                            and item[3].get('client_id') == client_id:
+                        return ('found', item[1])
+                except Exception:
+                    continue
+    history = None
     try:
         history = get_json(server + '/history', timeout=timeout)
-    except Exception:
-        return None
-    for pid, event in (history or {}).items():
-        try:
-            prompt = (event or {}).get('prompt') or []
-            extra = prompt[3] if len(prompt) >= 4 else {}
-            if isinstance(extra, dict) and extra.get('client_id') == client_id:
-                return pid
-        except Exception:
-            continue
-    return None
+        if not isinstance(history, dict):
+            errors.append(f'/history returned non-object ({type(history).__name__})')
+            history = None
+    except Exception as e:  # noqa: BLE001
+        errors.append(f'/history error: {type(e).__name__}: {str(e)[:200]}')
+        history = None
+    if isinstance(history, dict):
+        for pid, event in history.items():
+            try:
+                prompt = (event or {}).get('prompt') or []
+                extra = prompt[3] if len(prompt) >= 4 else {}
+                if isinstance(extra, dict) and extra.get('client_id') == client_id:
+                    return ('found', pid)
+            except Exception:
+                continue
+    if errors:
+        return ('unknown', '; '.join(errors))
+    return ('absent', None)
 
 
-def _submit_prompt(server, api, client_id):
+def _reconcile_prompt_after_timeout(server, client_id, reconcile_delays=PROMPT_RECONCILE_DELAYS) -> tuple[str, str | None]:
+    """Poll `_find_prompt_by_client_id` with bounded exponential backoff while
+    ComfyUI responds `"unknown"` (e.g. during 40GB model load stall). Returns
+    as soon as status resolves to `"found"` or `"absent"`, or returns
+    `("unknown", last_detail)` once the backoff window is exhausted."""
+    status, detail = _find_prompt_by_client_id(server, client_id)
+    if status != 'unknown':
+        return status, detail
+    for idx, delay in enumerate(reconcile_delays, start=1):
+        print(
+            'H3_PROMPT_RECONCILE_UNKNOWN',
+            f'probe {idx}/{len(reconcile_delays)} unknown ({detail}); waiting {delay}s before retry',
+            flush=True,
+        )
+        time.sleep(delay)
+        status, detail = _find_prompt_by_client_id(server, client_id)
+        if status != 'unknown':
+            return status, detail
+    return ('unknown', detail)
+
+
+def _submit_prompt(server, api, client_id, *, reconcile_delays=PROMPT_RECONCILE_DELAYS):
     """Submit once with a fixed client_id; on a read timeout the request
-    may already be queued, so check /queue + /history for this client_id
-    before any resubmit. At most one checked resubmit; a second timeout
-    fails closed naming the client_id so the operator can see whether
-    the prompt landed. A deterministic rejection (node_errors / no
-    prompt_id) raises immediately — a rejected workflow never queues."""
+    may already be queued, so reconcile /queue + /history in three states
+    (`found` / `absent` / `unknown`, v0.3.1 P1-3) before any resubmit.
+    - `found`: reuse existing prompt_id (zero duplicate submissions).
+    - `absent`: at most one checked resubmit.
+    - `unknown`: bounded backoff polling; NEVER blindly re-POST while
+      `unknown`, and fail closed with a diagnostic error if the window expires.
+    A deterministic rejection (node_errors / no prompt_id) raises immediately."""
     payload = {'prompt': api, 'client_id': client_id}
     for attempt in (1, 2):
         try:
@@ -574,11 +618,19 @@ def _submit_prompt(server, api, client_id):
         except Exception as e:  # noqa: BLE001 - transient vs fatal split below
             if not _is_transient_api_error(e):
                 raise
-            found = _find_prompt_by_client_id(server, client_id)
-            if found:
-                print('H3_PROMPT_RECOVERED', found,
+            status, detail = _reconcile_prompt_after_timeout(
+                server, client_id, reconcile_delays=reconcile_delays)
+            if status == 'found':
+                print('H3_PROMPT_RECOVERED', detail,
                       'submit timed out but the prompt is already queued/running', flush=True)
-                return {'prompt_id': found}
+                return {'prompt_id': detail}
+            if status == 'unknown':
+                raise RuntimeError(
+                    f'ComfyUI /prompt submit timed out on attempt {attempt} and '
+                    f'reconciliation for client_id {client_id} remained unknown '
+                    f'after bounded backoff ({detail}); refusing blind resubmit '
+                    f'to prevent duplicate inference. Submit error: '
+                    f'{type(e).__name__}: {str(e)[:300]}') from e
             if attempt == 2:
                 raise RuntimeError(
                     f'ComfyUI /prompt submit timed out twice and no queued/running '
@@ -2006,11 +2058,11 @@ def main():
             try:
                 remote_upload=upload_remote_archive(final,info,task,run_id,version,spec)
             except Exception as e:
-                try:write_job_state(ROOT,run_id,version,'REMOTE_UPLOAD_FAILED',extra={'remote_upload_failed':{'error_type':type(e).__name__,'error':str(e)[:300]}})
+                try:write_job_state(ROOT,run_id,version,_job_stage_for('remote_upload_failed'),extra={'remote_upload_failed':{'error_type':type(e).__name__,'error':str(e)[:300]}})
                 except Exception:pass
                 print('REMOTE_UPLOAD_FAILED_JSON:'+json.dumps({'error_type':type(e).__name__,'error':str(e)[:300]},ensure_ascii=False),flush=True)
         if remote_upload is not None:
-            try:write_job_state(ROOT,run_id,version,'REMOTE_UPLOAD_VERIFIED',extra={'remote_upload':remote_upload})
+            try:write_job_state(ROOT,run_id,version,_job_stage_for('remote_upload_verified'),extra={'remote_upload':remote_upload})
             except Exception:pass
             print('REMOTE_UPLOAD_JSON:'+json.dumps(remote_upload,ensure_ascii=False),flush=True)
         set_stage('done')

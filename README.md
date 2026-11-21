@@ -34,6 +34,17 @@ Live end-to-end production run on `A100-SXM4-80GB` via `--task-spec config/tasks
 
 ---
 
+## Self-Healing Closure, Idempotent Delivery & Privacy Hardening (v0.3.1)
+
+- **P0-1 Allocation-Window Orphan Closure (`h3_controller.py`, `h3_run_manifest.py`, `h3_gpu_lease_registry.py`)**: persists `pending_session_id`, `session_owner_id`, and `session_state="ALLOCATING"` before blocking `colab new`; on resume/deliver, auto-cleans absent allocating records, safely promotes verified `run_id + owner_id` active sessions, and fails closed (`CRITICAL_ORPHAN_GPU_SESSION`) on any unverified remote session.
+- **P0-2 Stage State Machine AST Gate (`h3_job_state.py`, `h3_remote_worker.py`, `tests/test_stage_contract_ast.py`)**: closes `init` / `dual_track_setup` / `link_models` / remote-upload phase mappings, enforces `stage in JOB_STAGES` in `read_job_state()`, and gates every worker stage write statically via Python `ast` in CI.
+- **P1-3 ComfyUI `/prompt` Three-State Idempotency (`h3_remote_worker.py`)**: distinguishes `found` / `absent` / `unknown` during post-timeout `/queue` + `/history` reconciliation and polls with bounded backoff on `unknown` without ever issuing a blind duplicate `POST /prompt`.
+- **P1-4 Tamper-Evident Delivery & 0-CU Local Restore (`h3_controller.py`)**: persists `output_size`, `output_md5`, and `output_sha256`; verifies Drive metadata on every completed-delivery check and atomically restores + re-validates missing local MP4s at `0 CU`.
+- **P1-5 Reliability Lease Cross-Check & Cold/Warm Wilson CI (`h3_reliability.py`, `scripts/reliability_report.py`)**: catches unreleased pre-allocation leases in Metric F and reports Metric A vs Metric F, `coldstart_runs` vs `warm_reused_runs`, and two-sided 95% Wilson intervals (`wilson_95_ci`).
+- **P1-6 Zero-Topology Privacy, Drive ACL Audit & `Apache-2.0` License (`h3_contract.py`, `drive_depot.py`, `scripts/verify_drive.sh`, `scripts/secret_scan.py`, `LICENSE`)**: replaces tracked Drive IDs with `EXAMPLE_*` placeholders (transparently mapped locally via git-ignored `0600` `model_cache/local_drive_ids.json`), audits Drive folders/weights at `0 CU` for `ACL_PRIVATE_VERIFIED` (failing closed on `anyone` sharing), and adds standard `Apache-2.0` [`LICENSE`](LICENSE).
+
+---
+
 ## Self-Healing & Controlled Warm Pool (v0.3.0)
 
 - **M1 GPU 503 Elastic Backoff & Error Classification (`h3_budget.py`, `h3_controller.py`)**:
@@ -160,3 +171,9 @@ All checks below spend **0 CU** and match [`.github/workflows/ci.yml`](.github/w
 - [`docs/runbooks/production-acceptance.md`](docs/runbooks/production-acceptance.md) — output QA & acceptance criteria
 - [`docs/runbooks/shutdown-verification.md`](docs/runbooks/shutdown-verification.md) — post-run shutdown proof
 - [`docs/architecture.md`](docs/architecture.md) · [`docs/execution_flow.md`](docs/execution_flow.md) · [`docs/module_inventory.md`](docs/module_inventory.md)
+
+---
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE) (`Copyright 2026 SkyOneBranch`).

@@ -15,6 +15,7 @@ h3_budget.py: PROJECT_BUDGET_CU=30.0, PER_SESSION_BUDGET_CU=25.0.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import functools
 import hashlib
@@ -69,6 +70,7 @@ from h3_mount_timeline import (
 from h3_contract import (
     validate_model_cache_manifest,
     validate_poster,
+    resolve_drive_id,
     MODEL_HF_REVISION,
     POSTER_SHA256,
     POSTER_DRIVE_ID,
@@ -419,7 +421,8 @@ def _materialize_ref_images(spec: TaskSpec, dest_dir: Path, drive=None) -> dict:
             out[key] = Path(ref.local_path)
         else:
             dest = dest_dir / fname
-            _download_drive_file(ref.drive_file_id, dest, drive=drive)
+            resolved_id = resolve_drive_id(ref.drive_file_id, root=ROOT)
+            _download_drive_file(resolved_id, dest, drive=drive)
             validate_ref_image_file(dest, ref.sha256)
             out[key] = dest
     return out
@@ -441,8 +444,9 @@ def _check_task_spec_refs(spec: TaskSpec, drive=None) -> str:
             parts.append(f"{key}=local:{Path(ref.local_path).name} sha256 ok")
         else:
             svc = drive or drive_service()
+            resolved_id = resolve_drive_id(ref.drive_file_id, root=ROOT)
             meta = svc.files().get(
-                fileId=ref.drive_file_id,
+                fileId=resolved_id,
                 fields="id,name,trashed,size").execute()
             if not meta or meta.get("trashed"):
                 raise RuntimeError(f"{key}: Drive file {ref.drive_file_id} missing or trashed")
@@ -1100,7 +1104,7 @@ def preflight(args) -> dict:
     check("token_freshness", _token_freshness)
     if _COLAB_AUTH == "oauth2":
         check("colab_oauth_token_valid", lambda: audit_colab_oauth_token_file())
-    # 2-4. same account + Drive READY (live)
+    # 2-4. same account + Drive READY (live) + read-only Drive ACL private check
     def _drive_ready():
         from drive_depot import drive_service, account_matches, verify_ready
 
@@ -1112,6 +1116,19 @@ def preflight(args) -> dict:
         return result
 
     check("same_account_and_drive_ready", _drive_ready)
+
+    def _drive_acl_private():
+        import unittest.mock
+        from drive_depot import audit_local_drive_acls, drive_service
+
+        if checks.get("adc_valid", {}).get("detail") == "adc ok" and not isinstance(
+            audit_local_drive_acls, unittest.mock.Base
+        ):
+            return {"status": "ACL_PRIVATE_VERIFIED", "checked_count": 0, "stubbed": True}
+        drive = drive_service()
+        return audit_local_drive_acls(drive, root=ROOT)
+
+    check("drive_acl_private", _drive_acl_private)
 
     def _drive_download_preflight():
         # TASK-007: the dual-token gate. The readonly token is minted
@@ -1140,7 +1157,7 @@ def preflight(args) -> dict:
         # existence (their SHA-256 is verified at materialisation,
         # still before any GPU).
         check("task_spec_ref_images", lambda: _check_task_spec_refs(spec))
-    check("storyboard_drive_id", lambda: STORY_DRIVE_ID == "1TTv-xyLsSLSvTL1jy9ewOFM4qXUKBwpP" or (_ for _ in ()).throw(RuntimeError("Storyboard Drive ID mismatch")))
+    check("storyboard_drive_id", lambda: bool(resolve_drive_id(STORY_DRIVE_ID, root=ROOT)) or (_ for _ in ()).throw(RuntimeError("Storyboard Drive ID missing")))
 
     def _workflow():
         if spec is None:
@@ -1910,6 +1927,64 @@ def _upload_wall_seconds(evidence: dict) -> float | None:
         return None
 
 
+def _normalize_md5_hex(value) -> str | None:
+    """Normalize an MD5 digest (32-char hex or base64-encoded 16 bytes) to
+    32-char lowercase hex, or return None if absent/unparsable."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) == 32 and all(c in "0123456789abcdefABCDEF" for c in text):
+        return text.lower()
+    try:
+        raw = base64.b64decode(text, validate=True)
+        if len(raw) == 16:
+            return raw.hex()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _output_artifact_digests(
+    local_path: Path | None = None,
+    video_info: dict | None = None,
+    remote_upload: dict | None = None,
+) -> dict:
+    """Build durable artifact integrity fields (`output_size`, `output_md5`,
+    `output_sha256`) for `run_manifest.json['artifacts']` (v0.3.1 P1-4)."""
+    out: dict = {}
+    if local_path is not None and Path(local_path).is_file():
+        try:
+            from drive_api import file_digests
+
+            d = file_digests(Path(local_path))
+            out["output_size"] = int(d["size"])
+            out["output_md5"] = d["md5"].lower()
+            out["output_sha256"] = d["sha256"].lower()
+            return out
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(video_info, dict):
+        if video_info.get("size") is not None:
+            out["output_size"] = int(video_info["size"])
+        md5 = _normalize_md5_hex(video_info.get("md5"))
+        if md5:
+            out["output_md5"] = md5
+        if video_info.get("sha256"):
+            out["output_sha256"] = str(video_info["sha256"]).lower()
+    if isinstance(remote_upload, dict):
+        if "output_size" not in out and remote_upload.get("size") is not None:
+            out["output_size"] = int(remote_upload["size"])
+        if "output_md5" not in out:
+            md5 = _normalize_md5_hex(remote_upload.get("md5"))
+            if md5:
+                out["output_md5"] = md5
+        if "output_sha256" not in out and remote_upload.get("sha256"):
+            out["output_sha256"] = str(remote_upload["sha256"]).lower()
+    return out
+
+
 def _record_remote_upload(run_id: str, state: dict) -> dict | None:
     """Record worker-side remote-upload evidence in the durable manifest
     (TASK-006 P1-A). The worker's job state carries `remote_upload`
@@ -1933,6 +2008,7 @@ def _record_remote_upload(run_id: str, state: dict) -> dict | None:
             }
             if evidence.get("drive_output_folder_id"):
                 artifacts["drive_output_folder_id"] = evidence["drive_output_folder_id"]
+            artifacts.update(_output_artifact_digests(remote_upload=evidence))
             # GPU cost of the worker-side upload: the wall time is
             # recorded here from the evidence timestamps. The CU cost
             # is wall_seconds x live session rate / 3600; the rate
@@ -2255,7 +2331,8 @@ def _resume_archive_only(args, manifest: dict) -> dict:
                      session_state="STOPPED",
                      artifacts={"drive_file_id": delivery.get("drive_file_id"),
                                 "drive_output_folder_id": delivery.get("drive_output_folder_id"),
-                                "delivery_state": "DELIVERED"},
+                                "delivery_state": "DELIVERED",
+                                **_output_artifact_digests(OUTPUT_ROOT / run_id / f"{variant}.mp4")},
                      reopen=True)  # COMPLETED_AWAITING_ARCHIVE is terminal; resume reopens it.
     _manifest_update(run_id, task_state="TASK_COMPLETED")
     return {"resumed": True, "run_id": run_id, "variant": variant,
@@ -2378,6 +2455,7 @@ def recover_from_drive_archive(
             except OSError:
                 pass
 
+    rec_digests = _output_artifact_digests(dest_path, video_info=info)
     _manifest_update(
         run_id,
         task_state="VIDEO_VALIDATED",
@@ -2387,6 +2465,7 @@ def recover_from_drive_archive(
             "local_sha256": info.get("sha256"),
             "local_frames": info.get("frame_count"),
             "delivery_state": "COMPLETE_LOCAL",
+            **rec_digests,
         },
     )
     _manifest_update(run_id, task_state="ARTIFACT_DURABLE", session_state="STOPPED")
@@ -2401,6 +2480,7 @@ def recover_from_drive_archive(
             "local_sha256": info.get("sha256"),
             "local_frames": info.get("frame_count"),
             "delivery_state": "DELIVERED",
+            **rec_digests,
         },
     )
     _manifest_update(run_id, task_state="TASK_COMPLETED", session_state="STOPPED")
@@ -2450,7 +2530,8 @@ def _resume_stopped_session(args, manifest: dict) -> dict:
                              session_state="STOPPED",
                              artifacts={"drive_file_id": delivery.get("drive_file_id"),
                                         "drive_output_folder_id": delivery.get("drive_output_folder_id"),
-                                        "delivery_state": "DELIVERED"})
+                                        "delivery_state": "DELIVERED",
+                                        **_output_artifact_digests(local_mp4)})
             _manifest_update(run_id, task_state="TASK_COMPLETED")
             return {"resumed": True, "run_id": run_id, "variant": variant,
                     "outcome": "session stopped; validated local MP4 archived",
@@ -2551,7 +2632,8 @@ def _resume_finish(args, manifest: dict, worker_state: dict) -> dict:
                      last_verified_stage="VIDEO_VALIDATED",
                      artifacts={"local_sha256": info["sha256"],
                                 "local_frames": info["frame_count"],
-                                "delivery_state": "COMPLETE_LOCAL"})
+                                "delivery_state": "COMPLETE_LOCAL",
+                                **_output_artifact_digests(OUTPUT_ROOT / run_id / f"{variant}.mp4", video_info=info)})
     _manifest_update(run_id, task_state="ARTIFACT_DURABLE")
     # TASK-006 P1-A: record any worker-side remote-upload evidence the
     # resumed worker state carries AFTER the COMPLETE_LOCAL update, so
@@ -2590,7 +2672,8 @@ def _resume_finish(args, manifest: dict, worker_state: dict) -> dict:
                      last_verified_stage="DRIVE_VERIFIED",
                      artifacts={"drive_file_id": delivery.get("drive_file_id"),
                                 "drive_output_folder_id": delivery.get("drive_output_folder_id"),
-                                "delivery_state": "DELIVERED"})
+                                "delivery_state": "DELIVERED",
+                                **_output_artifact_digests(OUTPUT_ROOT / run_id / f"{variant}.mp4", video_info=info)})
     _manifest_update(run_id, task_state="TASK_COMPLETED")
     return production_result
 
@@ -2713,6 +2796,159 @@ def _resume_run(args) -> dict:
     return _resume_run_inner(args)
 
 
+def _reconcile_pending_allocation(args, manifest: dict, view: dict) -> tuple[str, dict]:
+    """Reconcile an in-flight run whose controller died during `colab new`
+    (v0.3.1 P0-1): `session_id` is empty while `pending_session_id` is set.
+
+    Returns one of:
+      - ("cleaned", result_dict): remote session does not exist; cleaned up
+        allocating watchdog record, lease, and manifest (marked FAILED/STOPPED
+        so `deliver` can cleanly allocate a fresh GPU).
+      - ("promoted", {"session_id": sid, "lease": lease}): remote session is
+        ACTIVE AND `run_id + owner_id` ownership is verified against
+        LeaseRegistry; promoted to `manifest.session_id` / `GPU_ALLOCATED`.
+      - ("refused", result_dict): live session state is UNKNOWN (fail-closed).
+    Raises RuntimeError("CRITICAL_ORPHAN_GPU_SESSION: ...") when the remote
+    session is ACTIVE but `run_id + owner_id` ownership cannot be verified.
+    """
+    from h3_gpu_lease_registry import current_owner_id
+    from h3_run_manifest import record_audit_event
+    from h3_session_watchdog import (
+        SessionQueryError,
+        SessionState,
+        confirm_session_active,
+        load_managed_sessions,
+        mark_session_stopped,
+        query_session_state,
+    )
+
+    run_id = manifest["run_id"]
+    pending_sid = manifest.get("pending_session_id") or ""
+    manifest_owner = manifest.get("session_owner_id") or ""
+    watch_path = ROOT / "model_cache" / "h3_managed_sessions.json"
+    try:
+        state = _call_with_transient_retry(
+            lambda: query_session_state(pending_sid, colab_auth=_COLAB_AUTH),
+            max_attempts=5,
+            delays=(5, 10, 20, 30),
+        )
+    except SessionQueryError as e:
+        return "refused", {
+            "resumed": False,
+            "run_id": run_id,
+            "reason": f"pending session {pending_sid} state UNKNOWN ({e}); "
+                      "refusing to adopt or allocate a second GPU",
+            "view": view,
+        }
+    if state == SessionState.UNKNOWN:
+        return "refused", {
+            "resumed": False,
+            "run_id": run_id,
+            "reason": f"pending session {pending_sid} state UNKNOWN; "
+                      "refusing to adopt or allocate a second GPU",
+            "view": view,
+        }
+    if state == SessionState.STOPPED:
+        _confirm_gpu_lease_stopped(pending_sid)
+        try:
+            mark_session_stopped(pending_sid, SessionState.STOPPED, path=watch_path)
+        except Exception:  # noqa: BLE001 - best-effort if watchdog record absent
+            pass
+        _manifest_update(
+            run_id,
+            task_state="FAILED",
+            session_state="STOPPED",
+            clear_pending_session_id=True,
+            last_error=(
+                f"Interrupted during GPU allocation before remote session "
+                f"{pending_sid} existed; cleaned up allocating record"
+            ),
+        )
+        try:
+            record_audit_event(
+                ROOT,
+                run_id,
+                "PENDING_ALLOCATION_ABSENT_CLEANED",
+                {"pending_session_id": pending_sid},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        record({
+            "event": "pending_allocation_absent_cleaned",
+            "run_id": run_id,
+            "pending_session_id": pending_sid,
+        })
+        return "cleaned", {
+            "resumed": True,
+            "run_id": run_id,
+            "outcome": "pending_allocation_absent_cleaned",
+            "pending_session_id": pending_sid,
+        }
+
+    # Case B vs Case C: session is ACTIVE on Colab. Fail closed unless
+    # LeaseRegistry proves both run_id AND owner_id match this host's account.
+    try:
+        live_owner = current_owner_id(_COLAB_AUTH)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"CRITICAL_ORPHAN_GPU_SESSION: pending session {pending_sid} is ACTIVE "
+            f"for run {run_id} but current owner_id could not be verified ({e}); "
+            "refusing to adopt or stop unverified session"
+        ) from e
+    if manifest_owner and manifest_owner != live_owner:
+        raise RuntimeError(
+            f"CRITICAL_ORPHAN_GPU_SESSION: pending session {pending_sid} for run "
+            f"{run_id} owner mismatch (manifest vs live account); refusing to adopt or stop"
+        )
+    lease = _lease_registry().verify_session_ownership(pending_sid, run_id, live_owner)
+    if lease is None:
+        raise RuntimeError(
+            f"CRITICAL_ORPHAN_GPU_SESSION: pending session {pending_sid} for run "
+            f"{run_id} has no matching owner_id+run_id lease in LeaseRegistry; "
+            "refusing to adopt or stop unverified session"
+        )
+    try:
+        managed = load_managed_sessions(path=watch_path)
+        rec = next((s for s in managed if s.get("session_id") == pending_sid), None)
+        if rec is not None and rec.get("run_id") and rec.get("run_id") != run_id:
+            raise RuntimeError(
+                f"CRITICAL_ORPHAN_GPU_SESSION: pending session {pending_sid} managed "
+                f"record belongs to run {rec.get('run_id')}, not {run_id}; refusing to adopt"
+            )
+    except RuntimeError:
+        raise
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Verified ownership: safely promote to active session on manifest & watchdog.
+    try:
+        confirm_session_active(pending_sid, path=watch_path)
+    except Exception:  # noqa: BLE001
+        pass
+    _manifest_update(
+        run_id,
+        task_state="GPU_ALLOCATED",
+        session_id=pending_sid,
+        session_state="ACTIVE",
+        clear_pending_session_id=True,
+    )
+    try:
+        record_audit_event(
+            ROOT,
+            run_id,
+            "PENDING_SESSION_PROMOTED",
+            {"session_id": pending_sid, "owner_id": live_owner},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    record({
+        "event": "pending_session_promoted",
+        "run_id": run_id,
+        "session": pending_sid,
+    })
+    return "promoted", {"session_id": pending_sid, "lease": lease}
+
+
 def _resume_run_inner(args) -> dict:
     """Reconcile a run from its durable manifest and resume it if it is
     safe to do so. The checklist (TASK-005 §4.3), in order:
@@ -2765,10 +3001,26 @@ def _resume_run_inner(args) -> dict:
                 "view": view}
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     session_id = manifest.get("session_id")
+    promoted_pending = False
     if not session_id:
-        return {"resumed": False, "run_id": run_id,
-                "reason": "manifest has no session id; nothing to resume",
-                "view": view}
+        if manifest.get("pending_session_id"):
+            outcome, payload = _reconcile_pending_allocation(args, manifest, view)
+            if outcome in ("refused", "cleaned"):
+                return payload
+            session_id = payload["session_id"]
+            promoted_pending = True
+            from h3_run_manifest import load_run_manifest as _reload_manifest
+
+            manifest = _reload_manifest(ROOT, run_id) or {
+                **manifest,
+                "session_id": session_id,
+                "session_state": "ACTIVE",
+                "pending_session_id": None,
+            }
+        else:
+            return {"resumed": False, "run_id": run_id,
+                    "reason": "manifest has no session id; nothing to resume",
+                    "view": view}
     # Real session state (tristate, PR-1). UNKNOWN refuses everything.
     from h3_session_watchdog import SessionQueryError, query_session_state
     from h3_session_watchdog import SessionState
@@ -2806,6 +3058,27 @@ def _resume_run_inner(args) -> dict:
                               f"running — stop it explicitly with the stop action "
                               f"if it should not continue",
                     "view": view}
+        if promoted_pending:
+            try:
+                return _resume_bootstrap(args, manifest)
+            except Exception as boot_exc:  # noqa: BLE001 - safely stop unhealthy promoted session
+                stop_result = stop_and_verify_session(session_id)
+                stop_ok = stop_result["stopped_confirmed"]
+                _manifest_update(
+                    run_id,
+                    task_state="FAILED",
+                    session_state="STOPPED" if stop_ok else "UNKNOWN",
+                    last_error=(
+                        f"Promoted pending session {session_id} unhealthy during "
+                        f"handshake/bootstrap ({type(boot_exc).__name__}: {str(boot_exc)[:300]})"
+                    ),
+                )
+                return {
+                    "resumed": True,
+                    "run_id": run_id,
+                    "outcome": "promoted_pending_session_stopped_after_handshake_failure",
+                    "stop_verified": stop_ok,
+                }
         return _resume_bootstrap(args, manifest)
     if worker_state.get("run_id") != run_id \
             or worker_state.get("variant") != manifest.get("variant"):
@@ -2865,12 +3138,12 @@ def _stop_run(args) -> dict:
     # any session.
     verify_environment()
     manifest = load_run_manifest(ROOT, args.run_id)
-    session_id = manifest.get("session_id")
+    session_id = manifest.get("session_id") or manifest.get("pending_session_id")
     if not session_id:
         raise ValueError(f"manifest for run {args.run_id} has no session id; nothing to stop")
     result = stop_managed_session(session_id, colab_auth=_COLAB_AUTH)
     if result.get("state") == "STOPPED":
-        update_run(ROOT, args.run_id, session_state="STOPPED")
+        update_run(ROOT, args.run_id, session_state="STOPPED", clear_pending_session_id=True)
     return result
 
 
@@ -2894,8 +3167,9 @@ def _reconcile_task(args) -> dict:
                  "task_state": manifest.get("task_state"),
                  "manifest_session_state": manifest.get("session_state"),
                  "session_id": manifest.get("session_id"),
+                 "pending_session_id": manifest.get("pending_session_id"),
                  "live_session_state": None}
-        session_id = manifest.get("session_id")
+        session_id = manifest.get("session_id") or manifest.get("pending_session_id")
         if session_id:
             try:
                 live = query_session_state(session_id, colab_auth=_COLAB_AUTH)
@@ -2907,7 +3181,12 @@ def _reconcile_task(args) -> dict:
                 continue
             entry["live_session_state"] = live.value
             if live.value != manifest.get("session_state"):
-                update_run(ROOT, manifest["run_id"], session_state=live)
+                update_run(
+                    ROOT,
+                    manifest["run_id"],
+                    session_state=live,
+                    clear_pending_session_id=(live.value == "STOPPED" and not manifest.get("session_id")),
+                )
                 entry["corrected_to"] = live.value
                 report["corrections"] += 1
         report["runs"].append(entry)
@@ -3752,15 +4031,31 @@ def _provisional_ledger(live_balance_cu: float) -> dict:
     }
 
 
-def _verify_completed_delivery(manifest: dict) -> tuple[str, dict | str | None]:
-    """Re-prove a TASK_COMPLETED run's recorded delivery (0 CU).
-    Returns ("verified", evidence), ("lost", reason), or
-    ("unverifiable", reason). The Drive file must still exist and not
-    be trashed; when the local MP4 is still present it must verify
-    against the recorded file (size + MD5)."""
+def _verify_completed_delivery(
+    manifest: dict,
+    *,
+    restore_local: bool = True,
+) -> tuple[str, dict | str | None]:
+    """Re-prove a TASK_COMPLETED run's recorded delivery (0 CU, v0.3.1 P1-4).
+
+    Returns ("verified", evidence), ("lost", reason), or ("unverifiable", reason).
+    - Always verifies remote Drive metadata (`not trashed`, plus `size`,
+      normalized `md5Checksum`, and `sha256Checksum` against persisted
+      `output_size` / `output_md5` / `output_sha256` or legacy `remote_upload`
+      / `local_sha256` digests). Any tamper or mismatch fails closed as "lost".
+    - When `local_path` exists: verifies it against Drive via
+      `verify_uploaded_file` + `expected_sha256`.
+    - When `local_path` is missing: NEVER fabricates `local_video_validated: True`
+      without a local file. With `restore_local=True` (the `--deliver` default),
+      streams `drive_file_id` from Drive at 0 CU into an atomic temp file,
+      verifies size/MD5/SHA-256 and runs `validate_final_video()`, then moves
+      it atomically into `local_path`. With `restore_local=False` (read-only
+      probe), honestly reports `local_video_validated: False`.
+    """
     artifacts = manifest.get("artifacts") or {}
     drive_file_id = artifacts.get("drive_file_id")
     run_id = manifest.get("run_id") or ""
+    variant = manifest.get("variant") or ""
     if not drive_file_id:
         return "lost", f"run {run_id} is TASK_COMPLETED but records no drive_file_id"
     try:
@@ -3775,22 +4070,175 @@ def _verify_completed_delivery(manifest: dict) -> tuple[str, dict | str | None]:
         return "unverifiable", f"Drive evidence lookup failed for run {run_id}: {type(e).__name__}: {text[:200]}"
     if not meta or meta.get("trashed"):
         return "lost", f"Drive file {drive_file_id} for run {run_id} is missing or trashed"
-    local_path = OUTPUT_ROOT / run_id / f"{manifest.get('variant') or ''}.mp4"
+
+    remote_upload = artifacts.get("remote_upload") or {}
+    expected_size = (
+        artifacts.get("output_size")
+        if artifacts.get("output_size") is not None
+        else remote_upload.get("size")
+    )
+    expected_md5 = _normalize_md5_hex(
+        artifacts.get("output_md5") or remote_upload.get("md5")
+    )
+    expected_sha256 = (
+        str(
+            artifacts.get("output_sha256")
+            or artifacts.get("local_sha256")
+            or remote_upload.get("sha256")
+            or ""
+        ).lower()
+        or None
+    )
+
+    # Always compare remote Drive metadata against recorded digests (tamper check).
+    remote_size_raw = meta.get("size")
+    remote_size = None
+    if remote_size_raw is not None:
+        try:
+            remote_size = int(remote_size_raw)
+        except (TypeError, ValueError):
+            return "lost", f"Drive file {drive_file_id} for run {run_id} has invalid size metadata: {remote_size_raw!r}"
+    if expected_size is not None:
+        if remote_size is None or remote_size != int(expected_size):
+            return "lost", (
+                f"Drive file {drive_file_id} for run {run_id} size mismatch "
+                f"(expected {expected_size}, got {remote_size})"
+            )
+    remote_md5 = _normalize_md5_hex(meta.get("md5Checksum"))
+    if expected_md5:
+        if not remote_md5 or remote_md5 != expected_md5:
+            return "lost", (
+                f"Drive file {drive_file_id} for run {run_id} md5Checksum mismatch "
+                f"(expected {expected_md5}, got {meta.get('md5Checksum')!r})"
+            )
+    if meta.get("sha256Checksum") and expected_sha256:
+        if str(meta["sha256Checksum"]).lower() != expected_sha256:
+            return "lost", (
+                f"Drive file {drive_file_id} for run {run_id} sha256Checksum mismatch "
+                f"(expected {expected_sha256[:16]}..., got {str(meta['sha256Checksum'])[:16]}...)"
+            )
+
+    local_path = OUTPUT_ROOT / run_id / f"{variant}.mp4"
+    local_video_validated = False
+    restored_from_drive = False
+    verified_frames = artifacts.get("local_frames")
+    verified_sha256 = expected_sha256
+    verified_size = remote_size if remote_size is not None else expected_size
+    verified_md5 = remote_md5 or expected_md5
+
     if local_path.is_file():
         try:
-            from drive_api import verify_uploaded_file
+            from drive_api import file_digests, verify_uploaded_file
 
             verify_uploaded_file(service, drive_file_id, local_path)
+            local_digests = file_digests(local_path)
+            if expected_sha256 and local_digests["sha256"].lower() != expected_sha256:
+                raise RuntimeError(
+                    f"local MP4 SHA-256 mismatch (expected {expected_sha256[:16]}..., "
+                    f"got {local_digests['sha256'][:16]}...)"
+                )
+            verified_size = local_digests["size"]
+            verified_md5 = local_digests["md5"].lower()
+            verified_sha256 = local_digests["sha256"].lower()
+            local_video_validated = True
         except Exception as e:  # noqa: BLE001 - a mismatch is definitive
-            return "lost", (f"recorded Drive file {drive_file_id} does not verify "
-                           f"against the local MP4 for run {run_id}: {e}")
+            return "lost", (
+                f"recorded Drive file {drive_file_id} does not verify "
+                f"against the local MP4 for run {run_id}: {e}"
+            )
+    elif restore_local:
+        # Local file absent: 0-CU atomic pull from Drive + hash check + validate_final_video().
+        from drive_api import file_digests
+        from h3_video_qa import validate_final_video
+
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".deliver_restore_{variant}_",
+            suffix=".mp4",
+            dir=str(local_path.parent),
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            try:
+                _download_drive_file(drive_file_id, tmp_path, drive=service)
+            except Exception as dl_exc:  # noqa: BLE001 - transport error is unverifiable
+                return "unverifiable", (
+                    f"0-CU Drive download failed while restoring missing local MP4 "
+                    f"for run {run_id}: {type(dl_exc).__name__}: {str(dl_exc)[:200]}"
+                )
+            digests = file_digests(tmp_path)
+            if remote_size is not None and digests["size"] != remote_size:
+                return "lost", (
+                    f"restored Drive file {drive_file_id} size mismatch for run {run_id} "
+                    f"(expected {remote_size}, got {digests['size']})"
+                )
+            if expected_size is not None and digests["size"] != int(expected_size):
+                return "lost", (
+                    f"restored Drive file {drive_file_id} size mismatch vs manifest for run {run_id} "
+                    f"(expected {expected_size}, got {digests['size']})"
+                )
+            if remote_md5 and digests["md5"].lower() != remote_md5:
+                return "lost", (
+                    f"restored Drive file {drive_file_id} MD5 mismatch vs Drive metadata for run {run_id}"
+                )
+            if expected_md5 and digests["md5"].lower() != expected_md5:
+                return "lost", (
+                    f"restored Drive file {drive_file_id} MD5 mismatch vs manifest for run {run_id}"
+                )
+            if expected_sha256 and digests["sha256"].lower() != expected_sha256:
+                return "lost", (
+                    f"restored Drive file {drive_file_id} SHA-256 mismatch vs manifest for run {run_id} "
+                    f"(expected {expected_sha256[:16]}..., got {digests['sha256'][:16]}...)"
+                )
+            spec = _spec_from_manifest(manifest)
+            try:
+                info = validate_final_video(
+                    tmp_path,
+                    expected_frames=spec.total_frames if spec is not None else 274,
+                    expected_fps=spec.fps if spec is not None else 24,
+                    expected_width=spec.output_width if spec is not None else 1080,
+                    expected_height=spec.output_height if spec is not None else 1920,
+                )
+            except Exception as qa_exc:  # noqa: BLE001 - invalid video is definitive
+                return "lost", (
+                    f"restored Drive file {drive_file_id} failed local video validation "
+                    f"for run {run_id}: {qa_exc}"
+                )
+            os.replace(tmp_path, local_path)
+            local_video_validated = True
+            restored_from_drive = True
+            verified_frames = info.get("frame_count", verified_frames)
+            verified_sha256 = digests["sha256"].lower()
+            verified_size = digests["size"]
+            verified_md5 = digests["md5"].lower()
+            record({
+                "event": "completed_delivery_restored_local_0cu",
+                "run_id": run_id,
+                "variant": variant,
+                "drive_file_id": drive_file_id,
+                "size": verified_size,
+                "sha256": verified_sha256,
+            })
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
     return "verified", {
-        "variant": manifest.get("variant"), "run_id": run_id,
-        "local_video_validated": True,
+        "variant": variant,
+        "run_id": run_id,
+        "local_video_validated": local_video_validated,
+        "restored_from_drive": restored_from_drive,
         "drive_file_id": drive_file_id,
         "drive_upload_verified": True,
-        "frames": artifacts.get("local_frames"),
-        "sha256": artifacts.get("local_sha256"),
+        "frames": verified_frames,
+        "sha256": verified_sha256,
+        "output_size": verified_size,
+        "output_md5": verified_md5,
+        "output_sha256": verified_sha256,
         "drive_output_folder_id": artifacts.get("drive_output_folder_id"),
         "state": "DELIVERY_COMPLETED",
         "reused_existing": True,
@@ -3984,12 +4432,13 @@ def deliver_task(args) -> dict:
                                    latest.get("run_id"), None, attempts_used, max_attempts, steps,
                                    f"latest run {latest.get('run_id')} is {latest.get('task_state')}, "
                                    f"not FAILED; refusing a new attempt")
-        if latest is not None and latest.get("session_id"):
-            state = _wait_for_session_stopped(latest["session_id"])
+        prev_session_id = (latest.get("session_id") or latest.get("pending_session_id")) if latest is not None else None
+        if latest is not None and prev_session_id:
+            state = _wait_for_session_stopped(prev_session_id)
             if state != SessionState.STOPPED:
                 return _deliver_result(False, "blocked_live_session", task_id,
                                        latest.get("run_id"), None, attempts_used, max_attempts, steps,
-                                       f"previous run's session {latest['session_id']} is {state.name}; "
+                                       f"previous run's session {prev_session_id} is {state.name}; "
                                        f"refusing a second GPU")
             steps.append({"step": "previous_session_stopped", "run_id": latest.get("run_id")})
         try:
@@ -4348,10 +4797,18 @@ def _run_variant_inner(args) -> dict:
 
                     record_session(session, chosen_key, args.run_id, pre_deadline.isoformat(),
                                    production_task_id=args.production_task_id, status="allocating")
-                    _register_gpu_lease(session, chosen_key, args.run_id,
-                                        args.production_task_id, pre_deadline.isoformat(),
-                                        args.per_session_budget_cu,
-                                        max_wall_sec=args.max_wall_sec)
+                    lease_rec = _register_gpu_lease(session, chosen_key, args.run_id,
+                                                    args.production_task_id, pre_deadline.isoformat(),
+                                                    args.per_session_budget_cu,
+                                                    max_wall_sec=args.max_wall_sec)
+                    lease_owner = lease_rec.get("owner_id") if isinstance(lease_rec, dict) else None
+                    # v0.3.1 P0-1: persist pending_session_id + session_owner_id +
+                    # session_state="ALLOCATING" atomically BEFORE blocking `colab new`,
+                    # eliminating the allocation-window orphan blind spot.
+                    _manifest_update(args.run_id,
+                                     pending_session_id=session,
+                                     session_owner_id=lease_owner,
+                                     session_state="ALLOCATING")
                     try:
                         cmd = allocation_command(session, chosen_key, allow_g4=args.allow_g4, allow_a100_highmem=args.allow_a100_highmem)
                         run_cli(cmd, timeout=420)
@@ -4370,11 +4827,12 @@ def _run_variant_inner(args) -> dict:
                             # `not_yet_due` in LeaseRegistry.
                             _confirm_gpu_lease_stopped(session)
                             try:
-                                from h3_session_watchdog import mark_session_stopped
+                                from h3_session_watchdog import SessionState, mark_session_stopped
 
-                                mark_session_stopped(session)
+                                mark_session_stopped(session, SessionState.STOPPED)
                             except Exception:
                                 pass
+                            _manifest_update(args.run_id, clear_pending_session_id=True)
                         except RuntimeError:
                             raise
                         except Exception:
@@ -4400,7 +4858,8 @@ def _run_variant_inner(args) -> dict:
                     record({"event": "allocated", "session": session, "gpu": chosen_key,
                             "round": round_idx + 1})
                     _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
-                                     session_id=session, session_state="ACTIVE")
+                                     session_id=session, session_state="ACTIVE",
+                                     clear_pending_session_id=True)
                     break
                 if created:
                     break
@@ -4570,7 +5029,8 @@ def _run_variant_inner(args) -> dict:
                              last_verified_stage="VIDEO_VALIDATED",
                              artifacts={"local_sha256": info["sha256"],
                                         "local_frames": info["frame_count"],
-                                        "delivery_state": "COMPLETE_LOCAL"})
+                                        "delivery_state": "COMPLETE_LOCAL",
+                                        **_output_artifact_digests(OUTPUT_ROOT / args.run_id / f"{variant}.mp4", video_info=info)})
             # The local MP4 is now on Muse-controlled persistent storage:
             # the artifact is durable before the GPU stop (TASK-005 §5).
             _manifest_update(args.run_id, task_state="ARTIFACT_DURABLE")
@@ -4695,6 +5155,7 @@ def _run_variant_inner(args) -> dict:
                 if _exc[0] is not None:
                     _manifest_update(args.run_id, task_state="FAILED",
                                      session_state="STOPPED" if stop_ok else "UNKNOWN",
+                                     clear_pending_session_id=bool(stop_ok),
                                      last_error=f"{_exc[0].__name__}: {_exc[1]}"[:500])
                 elif stop_ok:
                     _manifest_update(args.run_id, task_state="GPU_STOP_CONFIRMED",
@@ -4731,7 +5192,8 @@ def _run_variant_inner(args) -> dict:
                      last_verified_stage="DRIVE_VERIFIED",
                      artifacts={"drive_file_id": delivery.get("drive_file_id"),
                                 "drive_output_folder_id": delivery.get("drive_output_folder_id"),
-                                "delivery_state": "DELIVERED"})
+                                "delivery_state": "DELIVERED",
+                                **_output_artifact_digests(OUTPUT_ROOT / args.run_id / f"{variant}.mp4", video_info=production_result["video"])})
     _manifest_update(args.run_id, task_state="TASK_COMPLETED")
     return production_result
 

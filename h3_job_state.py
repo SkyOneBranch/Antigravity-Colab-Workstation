@@ -44,8 +44,11 @@ JOB_STAGES = (
 # after object_info validation passes. INFERENCE_COMPLETED is written
 # explicitly after find_rendered_video/rescue succeeds.
 WORKER_PHASE_TO_JOB_STAGE = {
+    "init": "JOB_STARTED",
     "ensure_comfy": "JOB_STARTED",
+    "dual_track_setup": "RESTORING_MODELS",
     "restore_weights": "RESTORING_MODELS",
+    "link_models": "RESTORING_MODELS",
     "comfyui_start": "RESTORING_MODELS",
     "object_info_validation": "RESTORING_MODELS",
     "inference_submit": "INFERENCE_RUNNING",
@@ -116,4 +119,8 @@ def read_job_state(root) -> dict:
     for key in ("run_id", "variant", "stage"):
         if not state.get(key):
             raise ValueError(f"Job state file is missing required field: {key}")
+    if state["stage"] not in JOB_STAGES:
+        raise ValueError(
+            f"Job state file has unknown stage {state['stage']!r}; "
+            f"must be one of {JOB_STAGES}")
     return state

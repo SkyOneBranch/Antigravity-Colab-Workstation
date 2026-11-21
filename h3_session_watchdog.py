@@ -514,6 +514,18 @@ def reconcile_on_startup(colab_auth: str | None = None, path: Path = STATE_PATH)
                     return True
 
                 _mutate_session(s["session_id"], path, _fail)
+                # v0.3.1 P0-1: also release any pre-registered allocating lease
+                # in the sibling LeaseRegistry file so it never lingers as a
+                # phantom active lease.
+                try:
+                    lease_path = Path(path).parent / "h3_gpu_leases.json"
+                    if lease_path.is_file():
+                        from h3_gpu_lease_registry import LeaseRegistry
+
+                        LeaseRegistry(path=lease_path, mirror=None).confirm_stopped(
+                            s["session_id"], SessionState.STOPPED)
+                except Exception:  # noqa: BLE001 - best-effort sibling cleanup
+                    pass
                 failed_allocations.append(s["session_id"])
                 continue
             allocating_live.append(s["session_id"])

@@ -187,6 +187,8 @@ def create_run_manifest(root: Path, production_task_id: str, run_id: str,
         "workflow_sha256": workflow_sha256,
         "model_manifest_sha256": model_manifest_sha256,
         "session_id": "",
+        "pending_session_id": None,
+        "session_owner_id": None,
         "session_state": "UNKNOWN",
         "task_state": "TASK_AUTHORIZED",
         "last_heartbeat_utc": now,
@@ -245,6 +247,9 @@ def manifest_schema_version(manifest: dict) -> int:
 
 def update_run(root: Path, run_id: str, task_state: str | None = None,
                session_state=None, session_id: str | None = None,
+               pending_session_id: str | None = None,
+               clear_pending_session_id: bool = False,
+               session_owner_id: str | None = None,
                last_verified_stage: str | None = None,
                last_error: str | None = None, artifacts: dict | None = None,
                budget: dict | None = None, heartbeat: bool = False,
@@ -332,7 +337,7 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
 
     if session_state is not None:
         value = getattr(session_state, "value", session_state)
-        if value in ("ACTIVE", "WARM_POOLED", "STOPPED", "UNKNOWN") \
+        if value in ("ALLOCATING", "ACTIVE", "WARM_POOLED", "STOPPED", "UNKNOWN") \
                 and value != manifest.get("session_state"):
             manifest["session_state"] = value
             changed = True
@@ -350,6 +355,19 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
 
     if session_id is not None and session_id != manifest.get("session_id"):
         manifest["session_id"] = session_id
+        changed = True
+        if session_id and pending_session_id is None and manifest.get("pending_session_id") is not None:
+            manifest["pending_session_id"] = None
+
+    if pending_session_id is not None and pending_session_id != manifest.get("pending_session_id"):
+        manifest["pending_session_id"] = pending_session_id
+        changed = True
+    elif clear_pending_session_id and manifest.get("pending_session_id") is not None:
+        manifest["pending_session_id"] = None
+        changed = True
+
+    if session_owner_id is not None and session_owner_id != manifest.get("session_owner_id"):
+        manifest["session_owner_id"] = session_owner_id
         changed = True
 
     if last_error is not None and last_error != manifest.get("last_error"):
@@ -465,6 +483,8 @@ def recovery_view(root: Path, run_id: str) -> dict:
             "completed_stages": done, "current_stage": state, "next_stage": nxt,
             "session_state": manifest.get("session_state"),
             "session_id": manifest.get("session_id"),
+            "pending_session_id": manifest.get("pending_session_id"),
+            "session_owner_id": manifest.get("session_owner_id"),
             "artifacts": artifacts,
             # TASK-006 P1-A artifact axis (v1 manifests default safely):
             "delivery_state": artifacts.get("delivery_state"),

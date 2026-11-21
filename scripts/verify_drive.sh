@@ -23,6 +23,8 @@ PY
 if [ -f model_cache/verified_manifest.json ]; then
   echo "--- live: drive_depot.py verify (read-only) ---"
   "$PY" drive_depot.py verify --colab-auth "$COLAB_AUTH_MODE"
+  echo "--- live: drive_depot.py audit-acl (read-only, 0 CU) ---"
+  "$PY" drive_depot.py audit-acl --colab-auth "$COLAB_AUTH_MODE"
 else
   echo "No live model_cache/verified_manifest.json on disk; live Drive re-verification skipped (expected in a fresh checkout)."
 fi
