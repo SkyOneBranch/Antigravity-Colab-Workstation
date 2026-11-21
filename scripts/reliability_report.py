@@ -115,12 +115,33 @@ def compute_coldstart_summary(root: str | Path,
     wh_hits = sum(1 for b in wh_bools if b)
     wh_rate = round(wh_hits / len(wh_bools), 4) if wh_bools else None
 
-    warm_hits = sum(
-        1 for m in manifests
+    warm_manifests = [
+        m for m in manifests
         if (m.get("coldstart_metrics") or {}).get("warm_session_reused") is True
         or (m.get("artifacts") or {}).get("warm_session_reused") is True
-    )
+        or (m.get("bootstrap") or {}).get("mode") == "warm_reuse"
+    ]
+    cold_manifests = [m for m in manifests if m not in warm_manifests]
+    warm_hits = len(warm_manifests)
     warm_hit_rate = round(warm_hits / len(manifests), 4) if manifests else None
+
+    def _bucket_timing(bucket: list[dict]) -> dict:
+        vals = []
+        for m in bucket:
+            cs = m.get("coldstart_metrics") or {}
+            v = cs.get("total_coldstart_sec")
+            if v is None:
+                v = (m.get("bootstrap") or {}).get("bootstrap_wall_sec")
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
+                vals.append(float(v))
+        return {
+            "runs": len(bucket),
+            "samples": len(vals),
+            "p50": percentile(vals, 50),
+            "p90": percentile(vals, 90),
+            "min": round(min(vals), 3) if vals else None,
+            "max": round(max(vals), 3) if vals else None,
+        }
 
     total_stats = percentiles_map["total_coldstart_sec"]
     return {
@@ -134,6 +155,8 @@ def compute_coldstart_summary(root: str | Path,
         "wheelhouse_hit_rate": wh_rate,
         "warm_session_hits": warm_hits,
         "warm_session_hit_rate": warm_hit_rate,
+        "coldstart_runs": _bucket_timing(cold_manifests),
+        "warm_reused_runs": _bucket_timing(warm_manifests),
         "percentiles": percentiles_map,
     }
 

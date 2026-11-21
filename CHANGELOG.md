@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## v0.3.1 — 2026-11-21 — 0.00 CU Self-Healing Closure, Idempotent Tamper-Proof Delivery & Privacy Hardening (P0-1 ~ P1-6)
+
+Zero-CU reliability and security hardening release closing the remaining six
+self-healing, protocol, and public-repository governance gaps discovered during
+the post-v0.3.0 deep architecture audit. Verified end-to-end at **0.00 CU**
+(zero Colab sessions created).
+
+### Added / Fixed
+
+- **P0-1 Allocation-Window Orphan Closure (`h3_controller.py`, `h3_run_manifest.py`, `h3_gpu_lease_registry.py`, `h3_session_watchdog.py`)**:
+  - Atomically persists `pending_session_id`, `session_owner_id`, and `session_state="ALLOCATING"` into `run_manifest.json` **before** calling blocking `colab new` (fully backward-compatible with v1–v3 manifests).
+  - Added owner-verified reconciliation (`_reconcile_pending_allocation`, `LeaseRegistry.verify_session_ownership`) on `--deliver` / `resume` / `reconcile_on_startup`: cleans up absent `allocating` records and sibling leases automatically; safely promotes verified `run_id + owner_id` active sessions to `GPU_ALLOCATED` (or stops cleanly on handshake failure); strictly fails closed with `CRITICAL_ORPHAN_GPU_SESSION` for any unverified or foreign session.
+- **P0-2 Worker↔Controller Stage State Machine Contract & Static AST Gate (`h3_job_state.py`, `h3_remote_worker.py`, `tests/test_stage_contract_ast.py`)**:
+  - Explicitly mapped `"init": "JOB_STARTED"`, `"dual_track_setup": "RESTORING_MODELS"`, and `"link_models": "RESTORING_MODELS"` in `WORKER_PHASE_TO_JOB_STAGE`, and aligned remote-upload state writes to `_job_stage_for(...)` (`"INFERENCE_COMPLETED"`).
+  - Tightened `read_job_state()` to reject unknown stages outside `JOB_STAGES` with `ValueError`.
+  - Added static Python `ast` CI gate (`tests/test_stage_contract_ast.py`) scanning every `set_stage`, `write_job_state`, `_write_job_state_safe`, and `_LAST_STAGE` assignment in `h3_remote_worker.py` against `JOB_STAGES` and `h3_controller.JOB_STAGE_TO_MANIFEST_STAGE`.
+- **P1-3 ComfyUI `/prompt` Read-Timeout Three-State Reconciliation (`h3_remote_worker.py`)**:
+  - Refactored `_find_prompt_by_client_id()` to return explicit three-state tuples: `("found", prompt_id)`, `("absent", None)`, or `("unknown", error_detail)`.
+  - Updated `_submit_prompt()` with bounded exponential backoff polling during `"unknown"` states (e.g. during 40GB model loading stalls), strictly forbidding blind duplicate `POST /prompt` submissions while `"unknown"`.
+- **P1-4 Tamper-Evident Completed Delivery & 0-CU Local Restore (`h3_controller.py`)**:
+  - Persists `output_size`, `output_md5` (32-char lowercase hex), and `output_sha256` into `run_manifest.json["artifacts"]` (backward-compatible with legacy `remote_upload` / `local_sha256` fields).
+  - Hardened `_verify_completed_delivery()` to always verify remote Drive `not trashed`, `size`, and normalized `md5Checksum` (failing closed as `"lost"` on any tamper). When `local_path` is absent, `--deliver` performs a 0-CU atomic stream download from Drive + digest check + `validate_final_video()` before reporting `local_video_validated: True` (and read-only probes with `restore_local=False` honestly report `local_video_validated: False`).
+- **P1-5 Metric F Lease Cross-Check, Cold/Warm Stratification & Wilson 95% CI (`h3_reliability.py`, `scripts/reliability_report.py`)**:
+  - Closed the Metric F orphan-GPU check gap by inspecting `pending_session_id` and cross-checking `model_cache/h3_gpu_leases.json` by `production_task_id` / `run_id` even when `manifest.session_id` is empty.
+  - Added `wilson_95_ci: {"lower", "upper"}` to all rate metrics, side-by-side `summary_comparison` (Metric A vs Metric F with `73/73` zero-failure sample note), and `startup_mode_breakdown` (`coldstart_runs` vs `warm_reused_runs`) while keeping full top-level backward compatibility.
+- **P1-6 Public Drive ID Desensitization, 0-CU Drive ACL Audit & `LICENSE` (`h3_contract.py`, `h3_task_spec.py`, `h3_controller.py`, `drive_depot.py`, `scripts/secret_scan.py`, `scripts/verify_drive.sh`, `LICENSE`)**:
+  - Scrubbed all real Google Drive File/Folder IDs from tracked files in favor of synthetic `EXAMPLE_*` placeholders resolved locally via git-ignored `model_cache/local_drive_ids.json` (`0600`) or `H3_DRIVE_ID_*` env overrides, guarded by one-way SHA-256 and high-entropy Drive ID rules in `scripts/secret_scan.py`.
+  - Added read-only 0-CU Drive ACL audit (`drive_depot.py audit-acl`, wired into `scripts/verify_drive.sh` and `preflight`) that fails closed on any `type == "anyone"` public link exposure and reports `ACL_PRIVATE_VERIFIED` when strictly private.
+  - Added standard `Apache-2.0` root [`LICENSE`](LICENSE) (`Copyright 2026 SkyOneBranch`).
+
 ## v0.3.0 — 2026-11-19 — Self-Healing & Controlled Warm Pool (M1–M4)
 
 Resilience, bootstrap round-trip reduction, host-disconnect self-healing, and

@@ -52,6 +52,7 @@ from h3_contract import (
     STEPS,
     WIDTH,
     prompt_for,
+    resolve_drive_id,
     sha256_file,
 )
 
@@ -424,8 +425,17 @@ def spec_with_seed(spec: TaskSpec, seed: int) -> TaskSpec:
     return replace(spec, seed=seed)
 
 
+def resolve_ref_drive_id(ref: RefImage, *, root: Path | None = None) -> str | None:
+    """Resolve `ref.drive_file_id` through local git-ignored Drive ID overrides
+    (`model_cache/local_drive_ids.json` / env) when present."""
+    if ref.drive_file_id is None:
+        return None
+    return resolve_drive_id(ref.drive_file_id, root=root)
+
+
 __all__ = [
     "TaskSpec", "RefImage", "load_task_spec", "validate_ref_image_file",
+    "resolve_ref_drive_id",
     "task_spec_for_variant", "spec_with_seed",
     "OUTPUT_WIDTH_DEFAULT", "OUTPUT_HEIGHT_DEFAULT",
     "MAX_PROMPT_CHARS", "MAX_SHOTS",

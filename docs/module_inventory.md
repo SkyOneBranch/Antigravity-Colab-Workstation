@@ -219,3 +219,6 @@ Both are covered by `scripts/verify_manifest.py`.
 | `docs/issues/p0-fix-github-ci.md` | 1769 | 38f713c11f9e7368c811560d59b7a61ceb99ab2dceac00664bb256e8279efc40 | Markdown | Issue draft (TASK-002 §7) | n/a | n/a | Low |
 | `docs/issues/p0-remove-personal-data.md` | 1591 | 2953cef4f5b19a6b53b0dc2a7984c266eae3c03d71a24995a711bcd054aba921 | Markdown | Issue draft (TASK-002 §7) | n/a | n/a | Low |
 | `docs/issues/p1-fail-closed-watchdog.md` | 1831 | 325594e8fba4744d081ed9eb7147ec1a149acaddb90fe3fdb22f80e04fec1636 | Markdown | Issue draft (TASK-002 §7) | n/a | n/a | Low |
+| `LICENSE` | 10999 | 1abaccf79d07f3f08cb4b21a13aeaf2e5f781e8c37afcb1b13b0e5edde5dc3cd | Text | Apache License 2.0 (Copyright 2026 SkyOneBranch, v0.3.1 P1-6) | n/a | n/a | Low |
+| `tests/test_stage_contract_ast.py` | 9096 | 45e48acd2b7f87f5bbfc9085c93a342cd8be74588b93662d90956a1d3b832c24 | Python | Static AST gate locking Worker <-> Controller stage state machine contract (v0.3.1 P0-2) | n/a | self | Low |
+| `tests/test_v031_hardening.py` | 32432 | 7afd06c465290b78a4a2f6b384a3c782ba9b5d4830cb30fef35c270cfce1160e | Python | Regression suite for v0.3.1 P0-1/P1-3/P1-4/P1-5/P1-6 (allocation reconciliation, /prompt tristate, delivery tamper/restore, Metric F lease cross-check & Wilson CI, Drive ACL audit & privacy) | n/a | self | Low |

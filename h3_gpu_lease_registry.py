@@ -616,6 +616,41 @@ class LeaseRegistry:
         return next((x for x in self.list_leases()
                      if x.get("session_id") == session_id), None)
 
+    def find_leases_for_run(self, run_id: str) -> list[dict]:
+        """Return all leases matching `run_id` (primary or warm_run_ids)."""
+        if not run_id:
+            return []
+        return [
+            x for x in self.list_leases()
+            if x.get("run_id") == run_id
+            or run_id in (x.get("warm_run_ids") or [])
+        ]
+
+    def find_leases_for_task(self, production_task_id: str) -> list[dict]:
+        """Return all leases matching `production_task_id`."""
+        if not production_task_id:
+            return []
+        return [
+            x for x in self.list_leases()
+            if x.get("production_task_id") == production_task_id
+        ]
+
+    def verify_session_ownership(self, session_id: str, run_id: str,
+                                 owner_id: str) -> dict | None:
+        """Fail-closed ownership proof for a pending/allocating session
+        (v0.3.1 P0-1). Returns the matching lease dict ONLY when
+        session_id, run_id, and owner_id all match exactly and non-empty."""
+        if not (session_id and run_id and owner_id):
+            return None
+        lease = self.get_lease(session_id)
+        if lease is None:
+            return None
+        if lease.get("run_id") != run_id:
+            return None
+        if lease.get("owner_id") != owner_id:
+            return None
+        return lease
+
     def load_for_executor(self) -> tuple[list, str, bool]:
         """Mirror-first read for the backup executor. Returns
         (leases, source, degraded): source is "mirror" or "local";

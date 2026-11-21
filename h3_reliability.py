@@ -102,6 +102,7 @@ from h3_contract import TOTAL_FRAMES
 WILSON_Z = 1.96
 TARGET_RATE = 0.95
 MIN_SAMPLE_FOR_MEASURED = 30
+MIN_ZERO_FAILURE_SAMPLE_FOR_95_CI = 73
 
 # Delivery states at or after which a validated local MP4 exists.
 _DELIVERY_AT_LEAST_LOCAL = {
@@ -129,6 +130,7 @@ def _metric(k: int, n: int, definition: str,
     if n == 0:
         return {"definition": definition, "rate": None, "numerator": k,
                 "denominator": 0, "confidence_interval_95": None,
+                "wilson_95_ci": None,
                 "status": "UNKNOWN",
                 "unknown_reason": unknown_reason or "empty sample"}
     interval = wilson_interval(k, n)
@@ -136,7 +138,12 @@ def _metric(k: int, n: int, definition: str,
               else "INSUFFICIENT_SAMPLE")
     return {"definition": definition, "rate": round(k / n, 4),
             "numerator": k, "denominator": n,
-            "confidence_interval_95": interval, "status": status,
+            "confidence_interval_95": interval,
+            "wilson_95_ci": (
+                {"lower": interval[0], "upper": interval[1]}
+                if interval is not None else None
+            ),
+            "status": status,
             "unknown_reason": None}
 
 
@@ -322,6 +329,86 @@ def _evaluate_run_f(root: Path, manifest: dict) -> list[str]:
     return failed
 
 
+def _load_leases(root: Path) -> list[dict]:
+    """Read `model_cache/h3_gpu_leases.json` if present (read-only)."""
+    path = Path(root) / "model_cache" / "h3_gpu_leases.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        leases = data.get("leases") if isinstance(data, dict) else None
+        return [x for x in leases if isinstance(x, dict)] if isinstance(leases, list) else []
+    except Exception:
+        return []
+
+
+def _is_warm_reused_run(manifest: dict) -> bool:
+    """True when a run reused a warm-pooled session rather than cold-starting."""
+    return bool(
+        (manifest.get("coldstart_metrics") or {}).get("warm_session_reused") is True
+        or (manifest.get("artifacts") or {}).get("warm_session_reused") is True
+        or (manifest.get("bootstrap") or {}).get("mode") == "warm_reuse"
+    )
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return round(ordered[0], 3)
+    pos = (len(ordered) - 1) * (float(pct) / 100.0)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return round(ordered[lo], 3)
+    frac = pos - lo
+    return round(ordered[lo] + (ordered[hi] - ordered[lo]) * frac, 3)
+
+
+def _startup_mode_stats(runs: list[dict], label: str) -> dict:
+    """Compute stratified success + timing metrics for coldstart vs warm-reused runs."""
+    terminal = [m for m in runs if m.get("task_state") in rm.TERMINAL_STATES]
+    in_flight = [m for m in runs if m.get("task_state") not in rm.TERMINAL_STATES]
+    completed = [m for m in terminal if m.get("task_state") == "TASK_COMPLETED"]
+    failed = [m for m in terminal if m.get("task_state") == "FAILED"]
+    durations: list[float] = []
+    for m in runs:
+        cs = m.get("coldstart_metrics") or {}
+        val = cs.get("total_coldstart_sec")
+        if val is None:
+            val = (m.get("bootstrap") or {}).get("bootstrap_wall_sec")
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val)):
+            durations.append(float(val))
+    return {
+        "mode": label,
+        "runs_total": len(runs),
+        "terminal_runs": len(terminal),
+        "in_flight_runs": len(in_flight),
+        "completed_runs": len(completed),
+        "failed_runs": len(failed),
+        "first_attempt_success_rate": _metric(
+            sum(1 for m in completed if m.get("recovery_generation", 0) == 0),
+            len(terminal),
+            f"{label}: TASK_COMPLETED with recovery_generation == 0 / terminal runs",
+            unknown_reason=f"no terminal {label} runs in scope",
+        ),
+        "eventual_task_success_rate": _metric(
+            len(completed),
+            len(terminal),
+            f"{label}: TASK_COMPLETED / terminal runs",
+            unknown_reason=f"no terminal {label} runs in scope",
+        ),
+        "startup_wall_sec": {
+            "count": len(durations),
+            "p50": _percentile(durations, 50),
+            "p90": _percentile(durations, 90),
+            "min": round(min(durations), 3) if durations else None,
+            "max": round(max(durations), 3) if durations else None,
+        },
+    }
+
+
 def _evaluate_task_f(root: Path, task_id: str, runs: list[dict],
                      ledger: dict, now_dt: datetime,
                      time_filter_active: bool) -> dict:
@@ -388,13 +475,25 @@ def _evaluate_task_f(root: Path, task_id: str, runs: list[dict],
         if (_parse_utc(completed_at) or datetime.max.replace(tzinfo=timezone.utc)) > deadline:
             failed.append(f"completion: earliest fully-successful run "
                           f"completed at {completed_at} after deadline {deadline_raw}")
-    # (b) Every other run that ever allocated a session_id must be
-    # confirmed STOPPED with shutdown evidence — no orphan billable
-    # GPU may survive a delivered task. Runs that never allocated
-    # (no session_id) have nothing to leak.
+    # (b) Every run that ever allocated OR started allocating a session
+    # (including pending_session_id before `colab new` returned) AND every
+    # matching lease in `model_cache/h3_gpu_leases.json` must be confirmed
+    # STOPPED / released — no orphan billable GPU may survive a delivered task
+    # (v0.3.1 P1-5).
     successful_ids = {m.get("run_id") for m, _ in successful}
+    task_run_ids = {m.get("run_id") for m in runs if m.get("run_id")}
     for m in runs:
         run_id = m.get("run_id") or ""
+        pending_sid = m.get("pending_session_id")
+        if pending_sid or m.get("session_state") == "ALLOCATING":
+            stages = _stage_times(root, run_id)
+            if m.get("session_state") != "STOPPED" or "GPU_STOP_CONFIRMED" not in stages:
+                failed.append(
+                    f"shutdown: run {run_id} has unreleased pending/allocating session "
+                    f"{pending_sid or '<unknown>'} "
+                    f"(session_state={m.get('session_state')}, "
+                    f"GPU_STOP_CONFIRMED={'GPU_STOP_CONFIRMED' in stages})"
+                )
         if run_id in successful_ids:
             continue
         if not m.get("session_id"):
@@ -405,6 +504,24 @@ def _evaluate_task_f(root: Path, task_id: str, runs: list[dict],
                           f"but is not confirmed STOPPED "
                           f"(session_state={m.get('session_state')}, "
                           f"GPU_STOP_CONFIRMED={'GPU_STOP_CONFIRMED' in stages})")
+    for lease in _load_leases(root):
+        lease_task = lease.get("production_task_id") or ""
+        lease_run = lease.get("run_id") or ""
+        warm_runs = lease.get("warm_run_ids") or []
+        matches = (
+            (lease_task and lease_task == task_id)
+            or (lease_run and lease_run in task_run_ids)
+            or any(rid in task_run_ids for rid in warm_runs)
+        )
+        if not matches:
+            continue
+        lease_state = str(lease.get("last_confirmed_state") or "").upper()
+        if lease_state not in ("STOPPED", "RELEASED"):
+            failed.append(
+                f"shutdown: unreleased GPU lease {lease.get('session_id')} "
+                f"for task {task_id} (run {lease_run or '<unknown>'}, "
+                f"last_confirmed_state={lease.get('last_confirmed_state')!r})"
+            )
     try:
         spent = float(ledger.get("max_observed_spent_cu"))
         budget = float(ledger.get("project_budget_cu", PROJECT_BUDGET_CU))
@@ -596,15 +713,41 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
             f"{metric_b['denominator']} terminal runs; "
             f"the 95% target is not verified.")
 
-    warm_session_hits = sum(
-        1 for m in manifests
-        if (m.get("coldstart_metrics") or {}).get("warm_session_reused") is True
-        or (m.get("artifacts") or {}).get("warm_session_reused") is True
-    )
+    warm_runs = [m for m in manifests if _is_warm_reused_run(m)]
+    coldstart_runs = [m for m in manifests if not _is_warm_reused_run(m)]
+    warm_session_hits = len(warm_runs)
     warm_pooled_active_runs = sum(
         1 for m in manifests
         if m.get("session_state") == "WARM_POOLED"
     )
+    startup_mode_breakdown = {
+        "coldstart_runs": _startup_mode_stats(coldstart_runs, "coldstart"),
+        "warm_reused_runs": _startup_mode_stats(warm_runs, "warm_reused"),
+    }
+    summary_comparison = {
+        "metric_a_first_attempt": {
+            "rate": metric_a["rate"],
+            "numerator": metric_a["numerator"],
+            "denominator": metric_a["denominator"],
+            "wilson_95_ci": metric_a["wilson_95_ci"],
+            "status": metric_a["status"],
+        },
+        "metric_f_deadline_e2e": {
+            "rate": metric_f["rate"],
+            "numerator": metric_f["numerator"],
+            "denominator": metric_f["denominator"],
+            "wilson_95_ci": metric_f["wilson_95_ci"],
+            "status": metric_f["status"],
+            "target_verified": metric_f["target_verified"],
+        },
+        "min_zero_failure_sample_for_95_lower_bound": MIN_ZERO_FAILURE_SAMPLE_FOR_95_CI,
+        "sample_note": (
+            f"A 95% two-sided Wilson lower bound >= 0.95 requires at least "
+            f"{MIN_ZERO_FAILURE_SAMPLE_FOR_95_CI}/{MIN_ZERO_FAILURE_SAMPLE_FOR_95_CI} "
+            f"zero-failure observations (z={WILSON_Z}); smaller samples are reported "
+            f"as INSUFFICIENT_SAMPLE with exact Wilson intervals."
+        ),
+    }
 
     return {
         "root": str(root),
@@ -627,6 +770,8 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
             "budget_compliance_rate": metric_e,
             "deadline_bound_e2e_success_rate": metric_f,
         },
+        "summary_comparison": summary_comparison,
+        "startup_mode_breakdown": startup_mode_breakdown,
         "target_95_verified": target_verified,
         "target_95_evidence": target_evidence,
         "e_unknown_ledger_runs": sorted(e_unknown_runs),

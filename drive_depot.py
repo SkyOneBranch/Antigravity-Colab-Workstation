@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse, datetime as dt, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
 from auth_support import ensure_adc_isolation, resolve_colab_executable
 from pathlib import Path
-from h3_contract import MODEL_FILES, sha256_file
+from h3_contract import MODEL_FILES, resolve_drive_id, sha256_file
 from drive_api import file_digests, get_file_evidence, verify_uploaded_file
 
 ROOT=Path(__file__).resolve().parent
@@ -43,11 +43,11 @@ DRIVE_SCOPE='https://www.googleapis.com/auth/drive'
 CHUNK=8*1024*1024
 REQUIRED=tuple(sorted(MODEL_FILES))
 FOLDER_MIME='application/vnd.google-apps.folder'
-# Historical Drive file IDs from 2026-11-09 H3 report. A 404 means
-# inaccessible, NOT proven deleted. Reuse ONLY after checking HF/local hash.
+# Synthetic placeholder keys for historical VAE reuse (v0.3.1 P1-6).
+# Real Drive IDs for local runs live in git-ignored `model_cache/local_drive_ids.json`.
 LEGACY_VAE_IDS={
-    'vae/minimax_h3_video_vae_int8_convrot.safetensors':'1j40DmcsWEmyHFjRiTjYYOIhZAuTX-iOA',
-    'vae/minimax_h3_audio_vae_fp32.safetensors':'1NMhFPyq7qVSmZWJZg506LArud39lMTCF',
+    'vae/minimax_h3_video_vae_int8_convrot.safetensors':'EXAMPLE_LEGACY_VIDEO_VAE_ID',
+    'vae/minimax_h3_audio_vae_fp32.safetensors':'EXAMPLE_LEGACY_AUDIO_VAE_ID',
 }
 
 
@@ -156,6 +156,108 @@ def verify_drive_entry(service,record:dict)->dict:
             'sha256_source':'local_file_and_pinned_HF','server_sha256_available':bool(meta.get('sha256Checksum'))}
 
 
+def audit_drive_acl(service, targets:list[tuple[str,str]])->dict:
+    """Read-only 0-CU Drive ACL audit (v0.3.1 P1-6).
+
+    Inspects Drive `permissions` for each `(label, file_or_folder_id)` target.
+    Fails closed (`RuntimeError('DRIVE_ACL_PUBLIC_EXPOSURE: ...')`) if ANY
+    target exposes a `type == 'anyone'` permission (anyoneWithLink / public).
+    When all targets are strictly private, returns `status='ACL_PRIVATE_VERIFIED'`.
+    """
+    if not targets:
+        raise RuntimeError('DRIVE_ACL_AUDIT_EMPTY: no managed Drive targets to audit')
+    checked=[]
+    violations=[]
+    seen_ids:set[str]=set()
+    for label,target_id in targets:
+        if not target_id or target_id in seen_ids:
+            continue
+        seen_ids.add(target_id)
+        meta=service.files().get(
+            fileId=target_id,
+            fields='id,name,shared,permissions(id,type,role)',
+            supportsAllDrives=True,
+        ).execute()
+        perms=meta.get('permissions')
+        if perms is None:
+            perm_res=service.permissions().list(
+                fileId=target_id,
+                fields='permissions(id,type,role)',
+                supportsAllDrives=True,
+            ).execute()
+            perms=perm_res.get('permissions',[])
+        public_perms=[
+            {'id':p.get('id'),'type':p.get('type'),'role':p.get('role')}
+            for p in (perms or [])
+            if str(p.get('type','')).lower()=='anyone'
+        ]
+        entry={
+            'label':label,
+            'name':meta.get('name') or label,
+            'shared':bool(meta.get('shared',False)),
+            'permission_types':sorted({str(p.get('type','')).lower() for p in (perms or []) if p.get('type')}),
+            'public_anyone':bool(public_perms),
+        }
+        checked.append(entry)
+        if public_perms:
+            violations.append({'label':label,'name':entry['name'],'permissions':public_perms})
+    if violations:
+        names=', '.join(f"{v['label']}({v['name']})" for v in violations)
+        raise RuntimeError(
+            f"DRIVE_ACL_PUBLIC_EXPOSURE: public 'anyone' permission detected on {names}; "
+            'revoke public link sharing before running'
+        )
+    return {
+        'status':'ACL_PRIVATE_VERIFIED',
+        'checked_count':len(checked),
+        'checked':checked,
+        'public_violations':[],
+        'no_gpu_created':True,
+    }
+
+
+def audit_local_drive_acls(service, root:Path=ROOT)->dict:
+    """Discover locally configured managed Drive folders/files under `root/model_cache`
+    (model depot root + 4 weights, ComfyUI source cache folder, and video outputs
+    archive folder) and run read-only `audit_drive_acl` (0 CU)."""
+    cache_dir=Path(root)/'model_cache'
+    targets:list[tuple[str,str]]=[]
+    cfg_path=cache_dir/'depot_config.json'
+    if cfg_path.is_file():
+        cfg=read_json(cfg_path)
+        depot_root_id=cfg.get('drive_root_folder_id')
+        if depot_root_id:
+            targets.append(('model_depot_root',depot_root_id))
+    ready_path=cache_dir/'verified_manifest.json'
+    if ready_path.is_file():
+        manifest=read_json(ready_path)
+        if manifest.get('depot_root_id'):
+            targets.append(('model_depot_root',manifest['depot_root_id']))
+        for item in manifest.get('files',[]) or []:
+            fid=item.get('drive_file_id')
+            if fid:
+                targets.append((f"model:{item.get('path','weight')}",fid))
+    comfy_cache_path=cache_dir/'comfyui_source_manifest.json'
+    if comfy_cache_path.is_file():
+        comfy_manifest=read_json(comfy_cache_path)
+        src_folder_id=comfy_manifest.get('drive_folder_id') or comfy_manifest.get('folder_id')
+        if src_folder_id:
+            targets.append(('comfyui_source_cache_folder',src_folder_id))
+    # Also audit the video outputs archive root if it exists on Drive (read-only).
+    try:
+        out_folders=[
+            f for f in list_named(service,'root','Muse-H3-Video-Outputs')
+            if f.get('mimeType')==FOLDER_MIME
+        ]
+        for idx,folder in enumerate(out_folders):
+            label='video_outputs_folder' if idx==0 else f'video_outputs_folder_{idx+1}'
+            targets.append((label,folder['id']))
+    except Exception:
+        # Output folder lookup is best-effort if not yet created; depot targets still gate.
+        pass
+    return audit_drive_acl(service,targets)
+
+
 def verify_ready(service, account_ok:bool,ready_path:Path=READY)->dict:
     if not account_ok:raise RuntimeError('Colab account != Drive account')
     manifest=read_json(ready_path)
@@ -250,8 +352,9 @@ def maybe_copy_verified_legacy_vae(service, source:Path, target_folder:str, name
     This is an optimization, not trust in the old CACHE_READY.json. Full-Drive
     scope is necessary for access to historical other-app-created files.
     """
-    legacy_id=LEGACY_VAE_IDS.get(rel)
-    if not legacy_id or list_named(service,target_folder,name):return False
+    legacy_raw=LEGACY_VAE_IDS.get(rel)
+    legacy_id=resolve_drive_id(legacy_raw,root=ROOT) if legacy_raw else None
+    if not legacy_id or legacy_id.startswith('EXAMPLE_') or list_named(service,target_folder,name):return False
     try:
         old=get_file_evidence(service,legacy_id)
     except Exception as e:
@@ -1061,7 +1164,7 @@ def remote_seed(service,root_id:str,pin_path:Path=CONFIG_PIN_FILE,revision:str='
 
 def cli():
     p=argparse.ArgumentParser(description='Muse independent Drive H3 model depot; remote-seed explicitly allocates a temporary watchdog-protected Colab session')
-    p.add_argument('action',choices=('account-check','init','smoke','seed','remote-seed','verify'))
+    p.add_argument('action',choices=('account-check','init','smoke','seed','remote-seed','verify','audit-acl'))
     p.add_argument('--colab-auth',choices=('oauth2','adc'),default='oauth2')
     p.add_argument('--allow-drive-write',action='store_true')
     p.add_argument('--allow-large-transfer',action='store_true')
@@ -1107,6 +1210,8 @@ def cli():
                                revision=a.hf_revision,colab_auth=a.colab_auth,
                                max_wall_sec=a.max_wall_sec,downloader=a.downloader,
                                gpu_type=a.gpu_type)
+        elif a.action=='audit-acl':
+            result=audit_local_drive_acls(s,root=ROOT)
         else:result=verify_ready(s,ok)
         print(json.dumps(result,ensure_ascii=False,indent=2))
     except Exception as e:

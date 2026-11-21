@@ -5,17 +5,64 @@ Do not attempt to submit the GUI JSON directly to ComfyUI /prompt.
 from __future__ import annotations
 import hashlib
 import json
+import os
 from pathlib import Path
 
 POSTER_SHA256 = 'bd6d45312f340234d0fa06af0de5284949b2196f280677dd44468a300075c7bb'
-POSTER_DRIVE_ID = '1Punsy8qZKQktUcYyrNDpG46XMu_SWAJO'
-STORY_DRIVE_ID = '1TTv-xyLsSLSvTL1jy9ewOFM4qXUKBwpP'
+# Synthetic public placeholders (v0.3.1 P1-6). Real Drive IDs for local runs
+# live in git-ignored `model_cache/local_drive_ids.json` (mode 0600) or
+# `H3_DRIVE_ID_<KEY>` env overrides, resolved via `resolve_drive_id()`.
+POSTER_DRIVE_ID = 'EXAMPLE_POSTER_DRIVE_ID'
+STORY_DRIVE_ID = 'EXAMPLE_STORY_DRIVE_ID'
+LOCAL_DRIVE_IDS_REL = Path('model_cache') / 'local_drive_ids.json'
 # Pinned Hugging Face revision of the four model files (CACHE_READY
-# 2026-11-10; READY manifest Drive ID 1jLYefARIDs8VLtsCXJPuTU7zHXw0coly).
+# 2026-11-10; READY manifest Drive ID kept in local model_cache/depot_config.json).
 # Previously a bare literal in h3_controller.archive_variant_to_drive;
 # named here so the environment manifest and the upload path share one
 # source of truth (TASK-005 §6, Issue #29).
 MODEL_HF_REVISION = '54472221d27c695fca9621b0c3ed52f06c4af707'
+
+
+def load_local_drive_ids(root: Path | None = None) -> dict[str, str]:
+    """Load optional git-ignored local Drive ID mapping from
+    `model_cache/local_drive_ids.json`. Returns `{}` when absent or unreadable."""
+    base = Path(root) if root is not None else Path(__file__).resolve().parent
+    path = base / LOCAL_DRIVE_IDS_REL
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(k): str(v).strip()
+        for k, v in data.items()
+        if isinstance(k, str) and isinstance(v, str) and v.strip()
+    }
+
+
+def resolve_drive_id(value: str, *, root: Path | None = None) -> str:
+    """Resolve a Drive ID placeholder key via env (`H3_DRIVE_ID_<KEY>`) or
+    git-ignored `model_cache/local_drive_ids.json`. Concrete Drive IDs pass
+    through unchanged."""
+    if not isinstance(value, str):
+        return value
+    key = value.strip()
+    if not key:
+        return key
+    lookup_key = key[len('local:'):] if key.startswith('local:') else key
+    if lookup_key.replace('_', '').isalnum():
+        env_val = os.environ.get(f'H3_DRIVE_ID_{lookup_key.upper()}', '').strip()
+        if env_val:
+            return env_val
+    mapping = load_local_drive_ids(root=root)
+    if key in mapping:
+        return mapping[key]
+    if lookup_key in mapping:
+        return mapping[lookup_key]
+    return key
 WIDTH, HEIGHT, FPS = 736, 1312, 24
 ANIMATION_FRAMES, POSTER_FRAMES = 226, 48
 TOTAL_FRAMES = ANIMATION_FRAMES + POSTER_FRAMES
